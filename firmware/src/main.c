@@ -44,11 +44,13 @@ static void *pid_thread(void *arg) {
             float pid_out = pid_update(&s->pid, s->setpoint_v, input_v,
                                        dt, s->error_sign);
             float drive_v = s->use_lut ? aom_linearize(pid_out) : pid_out;
-            analog_write(ch, drive_v, &s->cal);
+            float actual_v = analog_write(ch, drive_v, &s->cal);
             s->telem_output_v = drive_v;
+            s->telem_actual_output_v = actual_v;
         } else {
             analog_write_raw(ch, 0.0f);
             s->telem_output_v = 0.0f;
+            s->telem_actual_output_v = 0.0f;
         }
 
         /* Advance to the next period */

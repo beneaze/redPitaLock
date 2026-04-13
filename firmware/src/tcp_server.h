@@ -21,7 +21,8 @@ typedef struct {
 
     /* --- Telemetry (written by PID thread, read by TCP thread) ---  */
     volatile float   telem_input_v;
-    volatile float   telem_output_v;
+    volatile float   telem_output_v;       /* target (pre-clamp)              */
+    volatile float   telem_actual_output_v; /* actual (post-clamp, on the DAC) */
 } channel_state_t;
 
 /* Starts the TCP server on TCP_PORT.  Runs forever (call from a thread).

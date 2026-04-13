@@ -11,7 +11,7 @@ REMOTE_DIR = "/root/redPitaLock/firmware"
 LOCAL_DIR = os.path.join(os.path.dirname(__file__), "firmware")
 
 
-def ssh_exec(ssh, cmd, check=True):
+def ssh_exec(ssh, cmd):
     print(f"  > {cmd}")
     _, stdout, stderr = ssh.exec_command(cmd)
     out = stdout.read().decode()
@@ -21,18 +21,14 @@ def ssh_exec(ssh, cmd, check=True):
         print(out.strip())
     if err.strip():
         print(err.strip(), file=sys.stderr)
-    if check and rc != 0:
-        print(f"Command failed with exit code {rc}", file=sys.stderr)
     return rc, out, err
 
 
 def upload_dir(sftp, local, remote):
-    """Recursively upload a directory."""
     try:
         sftp.stat(remote)
     except FileNotFoundError:
         sftp.mkdir(remote)
-
     for item in os.listdir(local):
         local_path = os.path.join(local, item)
         remote_path = f"{remote}/{item}"
@@ -50,7 +46,6 @@ def main():
     ssh.connect(RP_HOST, username=RP_USER, password=RP_PASS, timeout=10)
     print("Connected.\n")
 
-    # Upload firmware
     print("Uploading firmware...")
     sftp = ssh.open_sftp()
     try:
@@ -61,36 +56,33 @@ def main():
     sftp.close()
     print("Upload complete.\n")
 
-    # Kill any existing instance
-    print("Stopping any existing stabilizer_rp...")
-    ssh_exec(ssh, "killall stabilizer_rp 2>/dev/null || true", check=False)
+    print("Stopping old instance...")
+    ssh_exec(ssh, "killall stabilizer_rp 2>/dev/null; sleep 1; echo done")
 
-    # Compile
     print("\nCompiling...")
     rc, _, _ = ssh_exec(ssh, f"cd {REMOTE_DIR} && make clean && make")
     if rc != 0:
         print("Compilation failed!", file=sys.stderr)
         ssh.close()
         sys.exit(1)
-
     print("\nCompilation successful!")
 
-    # Run in background via nohup
     print("\nStarting stabilizer_rp...")
-    ssh_exec(ssh,
-        f"cd {REMOTE_DIR} && nohup ./stabilizer_rp > /tmp/stabilizer_rp.log 2>&1 & disown",
-        check=False)
-
-    # Verify it started
+    chan = ssh.get_transport().open_session()
+    chan.exec_command(
+        f"cd {REMOTE_DIR} && nohup ./stabilizer_rp > /tmp/stabilizer_rp.log 2>&1 &"
+    )
     time.sleep(2)
-    rc, out, _ = ssh_exec(ssh, "pgrep -a stabilizer_rp || echo 'NOT RUNNING'")
-    if "NOT RUNNING" in out:
-        print("\nFailed to start! Log output:")
-        ssh_exec(ssh, "cat /tmp/stabilizer_rp.log", check=False)
-    else:
-        print(f"\nstabilizer_rp is running on {RP_HOST}:5000")
-        print("Check log with: ssh root@<rp-host> cat /tmp/stabilizer_rp.log")
+    chan.close()
 
+    rc, out, _ = ssh_exec(ssh, "pgrep -a stabilizer_rp")
+    if "stabilizer_rp" in out:
+        print(f"\nstabilizer_rp is running on {RP_HOST}:5000")
+    else:
+        print("\nFailed to start! Log:")
+        ssh_exec(ssh, "cat /tmp/stabilizer_rp.log")
+
+    ssh_exec(ssh, "cat /tmp/stabilizer_rp.log")
     ssh.close()
 
 

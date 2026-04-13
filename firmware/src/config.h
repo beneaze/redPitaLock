@@ -49,7 +49,7 @@
 /* --------------- AOM LUT -------------------------------------------------- */
 /* Per-channel flag: when true the PID's normalised output (0-1) is passed    */
 /* through aom_linearize() before hitting the DAC.                            */
-#define DEFAULT_USE_LUT          1
+#define DEFAULT_USE_LUT          0
 
 /* --------------- TCP server ----------------------------------------------- */
 #define TCP_PORT                 5000

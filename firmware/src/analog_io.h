@@ -32,11 +32,13 @@ void analog_io_cleanup(void);
 float analog_read_raw(int ch);
 
 /* Write a DC level to fast output OUT<ch+1>.
- * `voltage` is clamped to the hardware range (-1 .. +1 V).                  */
-void  analog_write_raw(int ch, float voltage);
+ * `voltage` is clamped to the hardware range (-1 .. +1 V).
+ * Returns the actual clamped voltage that was written.                       */
+float analog_write_raw(int ch, float voltage);
 
-/* Convenience wrappers that apply calibration. */
+/* Convenience wrappers that apply calibration.
+ * analog_write returns the actual physical voltage after clamping.           */
 float analog_read(int ch, const analog_cal_t *cal);
-void  analog_write(int ch, float physical_v, const analog_cal_t *cal);
+float analog_write(int ch, float physical_v, const analog_cal_t *cal);
 
 #endif /* ANALOG_IO_H */

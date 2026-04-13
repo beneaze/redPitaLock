@@ -38,7 +38,7 @@ class TcpWorker(QThread):
     """Background thread that maintains the TCP connection, parses telemetry,
     and forwards commands from the GUI."""
 
-    data_received = Signal(int, float, float, float, int)  # ch, in_v, out_v, sp, enabled
+    data_received = Signal(int, float, float, float, float, int)  # ch, in_v, target_out, actual_out, sp, enabled
     connected = Signal()
     disconnected = Signal(str)
 
@@ -101,14 +101,15 @@ class TcpWorker(QThread):
                     continue
                 if line.startswith("D "):
                     parts = line.split()
-                    if len(parts) >= 5:
+                    if len(parts) >= 6:
                         try:
                             ch   = int(parts[1])
                             iv   = float(parts[2])
-                            ov   = float(parts[3])
-                            sp   = float(parts[4])
-                            en   = int(parts[5]) if len(parts) > 5 else 0
-                            self.data_received.emit(ch, iv, ov, sp, en)
+                            tgt  = float(parts[3])
+                            act  = float(parts[4])
+                            sp   = float(parts[5])
+                            en   = int(parts[6]) if len(parts) > 6 else 0
+                            self.data_received.emit(ch, iv, tgt, act, sp, en)
                         except (ValueError, IndexError):
                             pass
 
@@ -126,11 +127,12 @@ class ChannelPanel(QWidget):
     def __init__(self, ch_index: int, parent=None):
         super().__init__(parent)
         self.ch = ch_index
-        self.input_data  = deque(maxlen=HISTORY)
-        self.output_data = deque(maxlen=HISTORY)
-        self.sp_data     = deque(maxlen=HISTORY)
-        self.x_data      = deque(maxlen=HISTORY)
-        self.sample_idx  = 0
+        self.input_data      = deque(maxlen=HISTORY)
+        self.target_out_data = deque(maxlen=HISTORY)
+        self.actual_out_data = deque(maxlen=HISTORY)
+        self.sp_data         = deque(maxlen=HISTORY)
+        self.x_data          = deque(maxlen=HISTORY)
+        self.sample_idx      = 0
 
         self._build_ui()
 
@@ -226,7 +228,7 @@ class ChannelPanel(QWidget):
 
         # AOM LUT
         self.chk_lut = QCheckBox("AOM linearization (LUT)")
-        self.chk_lut.setChecked(True)
+        self.chk_lut.setChecked(False)
         self.chk_lut.toggled.connect(
             lambda v: self.command.emit(f"SET {self.ch} use_lut {int(v)}"))
         ctrl_layout.addWidget(self.chk_lut, row, 0, 1, 2)
@@ -259,7 +261,9 @@ class ChannelPanel(QWidget):
         self.plot_output = pg.PlotWidget(title=f"Ch{self.ch+1} Output Voltage")
         self.plot_output.setLabel("left", "Voltage", units="V")
         self.plot_output.setLabel("bottom", "Sample")
-        self.curve_output = self.plot_output.plot(pen=pg.mkPen("#FF5722", width=2))
+        self.plot_output.addLegend(offset=(10, 10))
+        self.curve_target_out = self.plot_output.plot(pen=pg.mkPen("#FF5722", width=2, style=Qt.DashLine), name="Target")
+        self.curve_actual_out = self.plot_output.plot(pen=pg.mkPen("#E91E63", width=2), name="Actual")
 
         plot_layout.addWidget(self.plot_input)
         plot_layout.addWidget(self.plot_output)
@@ -279,10 +283,11 @@ class ChannelPanel(QWidget):
 
     # ...................................................... data feed
 
-    @Slot(float, float, float, int)
-    def add_sample(self, input_v, output_v, setpoint_v, enabled):
+    @Slot(float, float, float, float, int)
+    def add_sample(self, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
         self.input_data.append(input_v)
-        self.output_data.append(output_v)
+        self.target_out_data.append(target_out_v)
+        self.actual_out_data.append(actual_out_v)
         self.sp_data.append(setpoint_v)
         self.x_data.append(self.sample_idx)
         self.sample_idx += 1
@@ -293,7 +298,8 @@ class ChannelPanel(QWidget):
         x = np.array(self.x_data)
         self.curve_input.setData(x, np.array(self.input_data))
         self.curve_sp.setData(x, np.array(self.sp_data))
-        self.curve_output.setData(x, np.array(self.output_data))
+        self.curve_target_out.setData(x, np.array(self.target_out_data))
+        self.curve_actual_out.setData(x, np.array(self.actual_out_data))
 
 
 # ----------------------------------------------------------- Main window
@@ -388,10 +394,10 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.send_command(cmd)
 
-    @Slot(int, float, float, float, int)
-    def _on_data(self, ch, input_v, output_v, setpoint_v, enabled):
+    @Slot(int, float, float, float, float, int)
+    def _on_data(self, ch, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
         if 0 <= ch < len(self.channel_panels):
-            self.channel_panels[ch].add_sample(input_v, output_v, setpoint_v, enabled)
+            self.channel_panels[ch].add_sample(input_v, target_out_v, actual_out_v, setpoint_v, enabled)
 
     def _refresh_plots(self):
         for panel in self.channel_panels:

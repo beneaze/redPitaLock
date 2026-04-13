@@ -146,8 +146,9 @@ static void *client_thread(void *arg) {
             for (int ch = 0; ch < NUM_CHANNELS; ch++) {
                 channel_state_t *s = &channels[ch];
                 char tbuf[128];
-                snprintf(tbuf, sizeof(tbuf), "D %d %.5f %.5f %.4f %d\n",
+                snprintf(tbuf, sizeof(tbuf), "D %d %.5f %.5f %.5f %.4f %d\n",
                          ch, s->telem_input_v, s->telem_output_v,
+                         s->telem_actual_output_v,
                          s->setpoint_v, s->enabled);
                 if (send(fd, tbuf, strlen(tbuf), MSG_NOSIGNAL) < 0)
                     goto done;

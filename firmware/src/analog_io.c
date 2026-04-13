@@ -20,8 +20,8 @@ int analog_io_init(void) {
     rp_AcqStart();
 
     /* --- Fast generation: DC mode on both channels --- */
+    rp_GenReset();
     for (int i = 0; i < NUM_CHANNELS; i++) {
-        rp_GenReset();
         rp_GenWaveform(rp_ch[i], RP_WAVEFORM_DC);
         rp_GenAmp(rp_ch[i], 0.0f);
         rp_GenOffset(rp_ch[i], 0.0f);
@@ -59,9 +59,10 @@ static float clampf(float v, float lo, float hi) {
     return v;
 }
 
-void analog_write_raw(int ch, float voltage) {
+float analog_write_raw(int ch, float voltage) {
     voltage = clampf(voltage, RP_OUTPUT_MIN, RP_OUTPUT_MAX);
     rp_GenOffset(rp_ch[ch], voltage);
+    return voltage;
 }
 
 /* ------------------------------------------------ calibrated wrappers */
@@ -71,7 +72,8 @@ float analog_read(int ch, const analog_cal_t *cal) {
     return raw * cal->input_scale + cal->input_offset;
 }
 
-void analog_write(int ch, float physical_v, const analog_cal_t *cal) {
+float analog_write(int ch, float physical_v, const analog_cal_t *cal) {
     float raw = (physical_v - cal->output_offset) / cal->output_scale;
-    analog_write_raw(ch, raw);
+    float actual_raw = analog_write_raw(ch, raw);
+    return actual_raw * cal->output_scale + cal->output_offset;
 }
