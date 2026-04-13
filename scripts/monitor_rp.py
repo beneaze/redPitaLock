@@ -242,7 +242,11 @@ class ChannelPanel(QWidget):
         self.sp_kd.setRange(0.0, 100.0)
         self.sp_kd.setDecimals(4)
         self.sp_kd.setSingleStep(0.001)
-        self.sp_kd.setValue(0.04)
+        self.sp_kd.setValue(0.0)
+        self.sp_kd.setToolTip(
+            "Derivative gain. Uses rate of change of the *photodiode voltage*, not raw error, "
+            "so ADC noise is not amplified. Start at 0; add a little only if you need damping."
+        )
         self.sp_kd.editingFinished.connect(
             lambda: self.command.emit(f"SET {self.ch} kd {self.sp_kd.value():.5f}"))
         ctrl_layout.addWidget(self.sp_kd, row, 1)

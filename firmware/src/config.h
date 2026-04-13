@@ -6,7 +6,8 @@
 /* --------------- Default PID gains (per-channel, adjustable at runtime) --- */
 #define DEFAULT_KP               4.0f
 #define DEFAULT_KI               2.0f
-#define DEFAULT_KD               0.04f
+/* Start with D=0; add small Kd only if needed. D uses meas derivative (see pid.c). */
+#define DEFAULT_KD               0.0f
 
 /* --------------- Feedback polarity ---------------------------------------- */
 /*  +1: more drive = more signal (diffracted beam)                            */
@@ -50,5 +51,8 @@
 /* --------------- Telemetry decimation ------------------------------------- */
 /* Send one telemetry frame every N loop iterations (per channel).            */
 #define DEFAULT_TELEMETRY_DECIM  10
+
+/* First-order LPF on ADC before PID: y += alpha*(raw-y). Higher = faster, noisier. */
+#define INPUT_LPF_ALPHA          0.20f
 
 #endif /* CONFIG_H */

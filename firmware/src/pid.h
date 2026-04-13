@@ -6,7 +6,9 @@ typedef struct {
     float ki;
     float kd;
     float integral;
-    float prev_error;
+    float prev_error;       /* unused for D; kept for possible future use       */
+    float prev_measurement; /* for derivative-on-measurement (noise robust)   */
+    int   deriv_init;       /* 0 = skip first D sample to avoid spike          */
     float out_min;
     float out_max;
     float integral_max;

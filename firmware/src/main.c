@@ -32,11 +32,22 @@ static void *pid_thread(void *arg) {
     channel_state_t  *s  = a->state;
     free(a);
 
+    static float in_lpf[NUM_CHANNELS];
+    static int   in_lpf_init[NUM_CHANNELS];
+
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
 
     while (running) {
-        float input_v = analog_read(ch, &s->cal);
+        float raw = analog_read(ch, &s->cal);
+        if (!in_lpf_init[ch]) {
+            in_lpf[ch] = raw;
+            in_lpf_init[ch] = 1;
+        } else {
+            in_lpf[ch] = INPUT_LPF_ALPHA * raw
+                       + (1.0f - INPUT_LPF_ALPHA) * in_lpf[ch];
+        }
+        float input_v = in_lpf[ch];
         s->telem_input_v = input_v;
 
         if (s->enabled) {
