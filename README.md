@@ -7,21 +7,53 @@ The system reads photodiode signals on the Red Pitaya's fast analog inputs
 (IN1, IN2) and outputs corrective voltages on the fast analog outputs
 (OUT1, OUT2) to stabilize laser intensity through an AOM or similar actuator.
 
+```mermaid
+flowchart TB
+    subgraph RP["Red Pitaya STEMlab 125-14 &ensp;(rp-XXXX.local)"]
+        direction LR
+        IN1["SMA IN1"] --> PID1["PID Ch 1\n(RT thread)"] --> OUT1["SMA OUT1"]
+        IN2["SMA IN2"] --> PID2["PID Ch 2\n(RT thread)"] --> OUT2["SMA OUT2"]
+    end
+
+    RP <-->|"TCP :5000\ntelemetry + commands"| PC["PC – Qt GUI\nPID on/off · gains · loop rate · plots"]
+
+    style RP fill:#1565c0,color:#fff
+    style PC fill:#607d8b,color:#fff
 ```
-┌───────────────────────────────────────────────────┐
-│  Red Pitaya  (rp-XXXX.local)                    │
-│                                                   │
-│  SMA IN1 ─► PID Ch1 (RT thread) ─► SMA OUT1      │
-│  SMA IN2 ─► PID Ch2 (RT thread) ─► SMA OUT2      │
-│                                                   │
-│  TCP server :5000  (telemetry + commands)          │
-└───────────────────┬───────────────────────────────┘
-                    │ TCP
-┌───────────────────▼───────────────────────────────┐
-│  PC  (Qt GUI)                                     │
-│  Per-channel: PID on/off, gains, loop rate, plots │
-└───────────────────────────────────────────────────┘
+
+## System diagram (per channel)
+
+```mermaid
+flowchart LR
+    LASER([Laser]) -->|beam| AOM[AOM]
+    AOM -->|beam| PICK{Pickoff}
+    PICK -->|main beam| EXP([To experiment])
+    PICK -->|sample| PD[Photodiode]
+
+    PD -->|voltage| DIV["Voltage divider\n3.3 → ±1 V"]
+    DIV --> RP["Red Pitaya\nADC → PID → DAC"]
+    RP --> COND["Op-amp\noffset + gain"]
+
+    RF["RF source\n80 MHz"] --> TTL["TTL switch"]
+    TTL -->|RF| MIX["Mixer"]
+    COND -->|"IF (DC)"| MIX
+    MIX --> BPF1["Bandpass\n63–77 MHz"]
+    BPF1 --> PRE["Pre-amp\n+20 dB"]
+    PRE --> AMP["Amplifier\n+25 dB"]
+    AMP --> BPF2["Bandpass\n63–77 MHz"]
+    BPF2 -->|RF drive| AOM
+
+    style LASER fill:#d32f2f,color:#fff
+    style AOM fill:#ff9800,color:#fff
+    style PD fill:#4caf50,color:#fff
+    style RP fill:#1565c0,color:#fff
+    style RF fill:#7b1fa2,color:#fff
+    style EXP fill:#607d8b,color:#fff
 ```
+
+**Optical loop:** The laser passes through the AOM; a pickoff sends a sample to the photodiode. A resistive voltage divider scales the photodiode signal to the Red Pitaya's ±1 V input range. The Red Pitaya's PID loop closes the feedback by outputting a corrective voltage through an op-amp conditioning stage.
+
+**RF drive chain:** An 80 MHz source enters a TTL switch, then a mixer whose IF port receives the Red Pitaya's DC control voltage. The mixed signal passes through a bandpass filter (63–77 MHz), a pre-amplifier (+20 dB), a power amplifier (+25 dB), a second bandpass filter, and finally drives the AOM.
 
 ## Features
 
