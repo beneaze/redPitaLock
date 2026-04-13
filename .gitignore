@@ -1,0 +1,15 @@
+# Build artifacts
+firmware/src/*.o
+firmware/stabilizer_rp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
