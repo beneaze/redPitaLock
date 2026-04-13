@@ -29,7 +29,7 @@ import pyqtgraph as pg
 
 DEFAULT_HOST = "rp-XXXX.local"
 DEFAULT_PORT = 5000
-HISTORY = 500
+HISTORY = 400
 
 
 # ------------------------------------------------------------------ TCP worker
@@ -71,6 +71,7 @@ class TcpWorker(QThread):
             return
 
         buf = ""
+
         while self._running:
             # Send queued commands
             while self._cmd_queue:
@@ -83,7 +84,7 @@ class TcpWorker(QThread):
 
             # Read telemetry
             try:
-                data = self._sock.recv(4096)
+                data = self._sock.recv(65536)
                 if not data:
                     self.disconnected.emit("server closed connection")
                     return
@@ -94,6 +95,9 @@ class TcpWorker(QThread):
                 self.disconnected.emit("recv failed")
                 return
 
+            # Parse all complete lines; keep only the latest sample per channel
+            # (server can send 100+ lines per recv — emitting each one floods the GUI).
+            latest: dict[int, tuple] = {}
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
                 line = line.strip()
@@ -103,15 +107,20 @@ class TcpWorker(QThread):
                     parts = line.split()
                     if len(parts) >= 6:
                         try:
-                            ch   = int(parts[1])
-                            iv   = float(parts[2])
-                            tgt  = float(parts[3])
-                            act  = float(parts[4])
-                            sp   = float(parts[5])
-                            en   = int(parts[6]) if len(parts) > 6 else 0
-                            self.data_received.emit(ch, iv, tgt, act, sp, en)
+                            ch = int(parts[1])
+                            iv = float(parts[2])
+                            tgt = float(parts[3])
+                            act = float(parts[4])
+                            sp = float(parts[5])
+                            en = int(parts[6]) if len(parts) > 6 else 0
+                            latest[ch] = (iv, tgt, act, sp, en)
                         except (ValueError, IndexError):
                             pass
+
+            if latest:
+                for ch in sorted(latest.keys()):
+                    iv, tgt, act, sp, en = latest[ch]
+                    self.data_received.emit(ch, iv, tgt, act, sp, en)
 
         if self._sock:
             self._sock.close()
@@ -159,16 +168,48 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(self.btn_enable, row, 0, 1, 2)
         row += 1
 
-        # Setpoint
+        # Setpoint (fast ADC LV range is about +/-1 V)
         ctrl_layout.addWidget(QLabel("Setpoint (V)"), row, 0)
         self.sp_setpoint = QDoubleSpinBox()
-        self.sp_setpoint.setRange(0.0, 10.0)
+        self.sp_setpoint.setRange(-1.0, 1.0)
         self.sp_setpoint.setDecimals(3)
         self.sp_setpoint.setSingleStep(0.01)
-        self.sp_setpoint.setValue(1.5)
+        self.sp_setpoint.setValue(0.5)
+        self.sp_setpoint.setToolTip(
+            "Target input voltage at the fast ADC (LV SMA ~ +/-1 V). "
+            "Values outside that range cannot be reached."
+        )
         self.sp_setpoint.editingFinished.connect(
             lambda: self.command.emit(f"SET {self.ch} setpoint {self.sp_setpoint.value():.4f}"))
         ctrl_layout.addWidget(self.sp_setpoint, row, 1)
+        row += 1
+
+        # PID output limits (controller command before DAC clamp +/-1 V)
+        ctrl_layout.addWidget(QLabel("PID out min (V)"), row, 0)
+        self.sp_out_min = QDoubleSpinBox()
+        self.sp_out_min.setRange(-1.0, 1.0)
+        self.sp_out_min.setDecimals(3)
+        self.sp_out_min.setSingleStep(0.05)
+        self.sp_out_min.setValue(0.0)
+        self.sp_out_min.setToolTip("Minimum command the PID is allowed to request (volts to DAC path).")
+        self.sp_out_min.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} out_min {self.sp_out_min.value():.4f}"))
+        ctrl_layout.addWidget(self.sp_out_min, row, 1)
+        row += 1
+
+        ctrl_layout.addWidget(QLabel("PID out max (V)"), row, 0)
+        self.sp_out_max = QDoubleSpinBox()
+        self.sp_out_max.setRange(-1.0, 1.0)
+        self.sp_out_max.setDecimals(3)
+        self.sp_out_max.setSingleStep(0.05)
+        self.sp_out_max.setValue(1.0)
+        self.sp_out_max.setToolTip(
+            "Maximum command the PID may request. Default 1.0 V matches STEMlab fast out. "
+            "If the loop never reaches setpoint, raise this (and gains) or check error sign."
+        )
+        self.sp_out_max.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} out_max {self.sp_out_max.value():.4f}"))
+        ctrl_layout.addWidget(self.sp_out_max, row, 1)
         row += 1
 
         # Kp
@@ -257,6 +298,9 @@ class ChannelPanel(QWidget):
         self.plot_input.addLegend(offset=(10, 10))
         self.curve_input = self.plot_input.plot(pen=pg.mkPen("#2196F3", width=2), name="Input")
         self.curve_sp    = self.plot_input.plot(pen=pg.mkPen("#4CAF50", width=2, style=Qt.DashLine), name="Setpoint")
+        for c in (self.curve_input, self.curve_sp):
+            c.setDownsampling(auto=True, method="peak")
+            c.setClipToView(True)
 
         self.plot_output = pg.PlotWidget(title=f"Ch{self.ch+1} Output Voltage")
         self.plot_output.setLabel("left", "Voltage", units="V")
@@ -264,6 +308,9 @@ class ChannelPanel(QWidget):
         self.plot_output.addLegend(offset=(10, 10))
         self.curve_target_out = self.plot_output.plot(pen=pg.mkPen("#FF5722", width=2, style=Qt.DashLine), name="Target")
         self.curve_actual_out = self.plot_output.plot(pen=pg.mkPen("#E91E63", width=2), name="Actual")
+        for c in (self.curve_target_out, self.curve_actual_out):
+            c.setDownsampling(auto=True, method="peak")
+            c.setClipToView(True)
 
         plot_layout.addWidget(self.plot_input)
         plot_layout.addWidget(self.plot_output)

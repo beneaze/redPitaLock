@@ -13,8 +13,8 @@
 /*  -1: more drive = less signal (0th-order / pass-through)                   */
 #define DEFAULT_ERROR_SIGN       1.0f
 
-/* --------------- Setpoint (volts, in the *physical* input domain) --------- */
-#define DEFAULT_SETPOINT_V       1.5f
+/* --------------- Setpoint (V at fast ADC, LV range ~ +/-1 V) ---------------- */
+#define DEFAULT_SETPOINT_V       0.50f
 
 /* --------------- PID output limits (normalised: 0 = null, 1 = max) -------- */
 #define PID_OUT_MIN              0.0f
