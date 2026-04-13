@@ -68,12 +68,11 @@ float analog_write_raw(int ch, float voltage) {
 /* ------------------------------------------------ calibrated wrappers */
 
 float analog_read(int ch, const analog_cal_t *cal) {
-    float raw = analog_read_raw(ch);
-    return raw * cal->input_scale + cal->input_offset;
+    (void)cal;
+    return analog_read_raw(ch);
 }
 
-float analog_write(int ch, float physical_v, const analog_cal_t *cal) {
-    float raw = (physical_v - cal->output_offset) / cal->output_scale;
-    float actual_raw = analog_write_raw(ch, raw);
-    return actual_raw * cal->output_scale + cal->output_offset;
+float analog_write(int ch, float voltage, const analog_cal_t *cal) {
+    (void)cal;
+    return analog_write_raw(ch, voltage);
 }

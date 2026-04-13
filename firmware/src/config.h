@@ -28,17 +28,9 @@
 #define DEFAULT_LOOP_PERIOD_US   1000   /* 1 kHz */
 
 /* --------------- Analog I/O calibration ----------------------------------- */
-/*                                                                            */
-/* physical_V = raw_rp_V * INPUT_SCALE + INPUT_OFFSET                         */
-/*                                                                            */
-/* For a 3.3:1 resistive divider on each input (maps 0-3.3 V to 0-1 V on     */
-/* the Red Pitaya LV input):                                                  */
-#define DEFAULT_INPUT_SCALE      3.3f
+/* No scaling -- raw Red Pitaya voltages are used directly.                    */
+#define DEFAULT_INPUT_SCALE      1.0f
 #define DEFAULT_INPUT_OFFSET     0.0f
-
-/* raw_rp_V = (physical_V - OUTPUT_OFFSET) / OUTPUT_SCALE                     */
-/*                                                                            */
-/* Adjust per channel to match your external op-amp conditioning stage.        */
 #define DEFAULT_OUTPUT_SCALE     1.0f
 #define DEFAULT_OUTPUT_OFFSET    0.0f
 
