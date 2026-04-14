@@ -4,7 +4,9 @@ monitor_rp.py -- Qt control GUI for the redPitaLock two-channel PID stabilizer.
 Connects to the Red Pitaya daemon over TCP and provides:
   * Per-channel PID enable/disable (off by default)
   * Live adjustment of Kp, Ki, Kd, setpoint, loop rate, error sign, AOM LUT
-  * Real-time pyqtgraph plots of analog input and output voltage
+  * Real-time pyqtgraph plots of analog input and output voltage vs time
+  * Optional CSV recording of input (photodiode) voltage vs time for stability checks
+  * Optional histogram of input with Gaussian overlay and mean / std (View menu)
 
 Usage:
     python monitor_rp.py                       # default host rp-XXXX.local
@@ -12,24 +14,42 @@ Usage:
     python monitor_rp.py rp-XXXX.local 5000    # explicit host + port
 """
 
-import sys
+import csv
 import socket
-import numpy as np
+import sys
+import time
 from collections import deque
+from typing import Optional
 
+import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget,
-    QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QPushButton, QDoubleSpinBox, QSpinBox, QComboBox,
-    QLabel, QLineEdit, QStatusBar, QCheckBox,
+    QApplication,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QSpinBox,
+    QStatusBar,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+    QWidgetAction,
 )
-from PySide6.QtGui import QFont
 import pyqtgraph as pg
 
 DEFAULT_HOST = "rp-XXXX.local"
 DEFAULT_PORT = 5000
 HISTORY = 400
+DEFAULT_HISTORY_SECONDS = 10.0
 
 
 # ------------------------------------------------------------------ TCP worker
@@ -39,6 +59,7 @@ class TcpWorker(QThread):
     and forwards commands from the GUI."""
 
     data_received = Signal(int, float, float, float, float, int)  # ch, in_v, target_out, actual_out, sp, enabled
+    params_received = Signal(int, dict)                            # ch, {key: value_str, ...}
     autotune_done = Signal(int, float, float, float, float)       # ch, Ku, Tu, Kp, Ki
     autotune_failed = Signal(int)                                  # ch
     autotune_progress = Signal(int, int, int, float)               # ch, crossings, cycles, elapsed_s
@@ -135,6 +156,19 @@ class TcpWorker(QThread):
                             self.autotune_failed.emit(int(parts[1]))
                         except (ValueError, IndexError):
                             pass
+                elif line.startswith("P "):
+                    parts = line.split(None, 2)
+                    if len(parts) >= 3:
+                        try:
+                            p_ch = int(parts[1])
+                            kv = {}
+                            for token in parts[2].split():
+                                if "=" in token:
+                                    k, v = token.split("=", 1)
+                                    kv[k] = v
+                            self.params_received.emit(p_ch, kv)
+                        except (ValueError, IndexError):
+                            pass
                 elif line.startswith("A "):
                     parts = line.split()
                     if len(parts) >= 6:
@@ -171,9 +205,11 @@ class ChannelPanel(QWidget):
         self.target_out_data = deque(maxlen=HISTORY)
         self.actual_out_data = deque(maxlen=HISTORY)
         self.sp_data         = deque(maxlen=HISTORY)
-        self.x_data          = deque(maxlen=HISTORY)
-        self.sample_idx      = 0
+        self.t_data          = deque(maxlen=HISTORY)  # elapsed time (s) since first sample
+        self._sample_count   = 0
+        self._t0: Optional[float] = None
         self._autotuning     = False
+        self._stats_visible  = False
 
         self._build_ui()
 
@@ -421,7 +457,7 @@ class ChannelPanel(QWidget):
 
         self.plot_input = pg.PlotWidget(title=f"Ch{self.ch+1} Analog Input")
         self.plot_input.setLabel("left", "Voltage", units="V")
-        self.plot_input.setLabel("bottom", "Sample")
+        self.plot_input.setLabel("bottom", "Time", units="s")
         self.plot_input.addLegend(offset=(10, 10))
         self.curve_input = self.plot_input.plot(pen=pg.mkPen("#2196F3", width=2), name="Input")
         self.curve_sp    = self.plot_input.plot(pen=pg.mkPen("#4CAF50", width=2, style=Qt.DashLine), name="Setpoint")
@@ -431,7 +467,7 @@ class ChannelPanel(QWidget):
 
         self.plot_output = pg.PlotWidget(title=f"Ch{self.ch+1} Output Voltage")
         self.plot_output.setLabel("left", "Voltage", units="V")
-        self.plot_output.setLabel("bottom", "Sample")
+        self.plot_output.setLabel("bottom", "Time", units="s")
         self.plot_output.addLegend(offset=(10, 10))
         self.curve_target_out = self.plot_output.plot(pen=pg.mkPen("#FF5722", width=2, style=Qt.DashLine), name="Target")
         self.curve_actual_out = self.plot_output.plot(pen=pg.mkPen("#E91E63", width=2), name="Actual")
@@ -439,11 +475,83 @@ class ChannelPanel(QWidget):
             c.setDownsampling(auto=True, method="peak")
             c.setClipToView(True)
 
+        self.plot_stats = pg.PlotWidget(title=f"Ch{self.ch+1} Input distribution (stability)")
+        self.plot_stats.setLabel("left", "Count")
+        self.plot_stats.setLabel("bottom", "Input voltage", units="V")
+        self._bar_item = pg.BarGraphItem(x=[], height=[], width=0, brush="#42A5F5")
+        self.plot_stats.addItem(self._bar_item)
+        self.curve_gauss = self.plot_stats.plot(
+            pen=pg.mkPen("#E65100", width=2), name="Gaussian fit")
+        self.plot_stats.addLegend(offset=(10, 10))
+        self.plot_stats.hide()
+
         plot_layout.addWidget(self.plot_input)
         plot_layout.addWidget(self.plot_output)
+        plot_layout.addWidget(self.plot_stats)
 
         root.addWidget(ctrl_box)
         root.addWidget(plot_widget, stretch=1)
+
+    # ...................................................... param sync
+
+    def sync_from_params(self, kv: dict):
+        """Update all widgets from a key=value dict received from the server.
+        Blocks signals so we don't re-emit SET commands back to the device."""
+        def _f(v): return float(v)
+        def _i(v): return int(float(v))
+
+        for widget in (
+            self.btn_enable, self.sp_setpoint, self.sp_out_min, self.sp_out_max,
+            self.sp_kp, self.sp_ki, self.sp_kd, self.sp_loop, self.cb_sign,
+            self.chk_lut, self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
+            self.sp_wave_amp, self.sp_wave_offset, self.sp_at_amp,
+        ):
+            widget.blockSignals(True)
+
+        if "enabled" in kv:
+            en = _i(kv["enabled"])
+            self.btn_enable.setChecked(bool(en))
+            self.btn_enable.setText("PID ON" if en else "PID OFF")
+        if "setpoint" in kv:
+            self.sp_setpoint.setValue(_f(kv["setpoint"]))
+        if "out_min" in kv:
+            self.sp_out_min.setValue(_f(kv["out_min"]))
+        if "out_max" in kv:
+            self.sp_out_max.setValue(_f(kv["out_max"]))
+        if "kp" in kv:
+            self.sp_kp.setValue(_f(kv["kp"]))
+        if "ki" in kv:
+            self.sp_ki.setValue(_f(kv["ki"]))
+        if "kd" in kv:
+            self.sp_kd.setValue(_f(kv["kd"]))
+        if "loop_rate" in kv:
+            self.sp_loop.setValue(_i(kv["loop_rate"]))
+        if "error_sign" in kv:
+            self.cb_sign.setCurrentIndex(0 if _f(kv["error_sign"]) >= 0 else 1)
+        if "use_lut" in kv:
+            self.chk_lut.setChecked(bool(_i(kv["use_lut"])))
+        if "out_mode" in kv:
+            self.cb_out_mode.setCurrentIndex(_i(kv["out_mode"]))
+        if "manual_v" in kv:
+            self.sp_manual_v.setValue(_f(kv["manual_v"]))
+        if "wave_freq" in kv:
+            self.sp_wave_freq.setValue(_f(kv["wave_freq"]))
+        if "wave_amp" in kv:
+            self.sp_wave_amp.setValue(_f(kv["wave_amp"]))
+        if "wave_offset" in kv:
+            self.sp_wave_offset.setValue(_f(kv["wave_offset"]))
+        if "integral_max" in kv:
+            pass
+
+        for widget in (
+            self.btn_enable, self.sp_setpoint, self.sp_out_min, self.sp_out_max,
+            self.sp_kp, self.sp_ki, self.sp_kd, self.sp_loop, self.cb_sign,
+            self.chk_lut, self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
+            self.sp_wave_amp, self.sp_wave_offset, self.sp_at_amp,
+        ):
+            widget.blockSignals(False)
+
+        self._update_manual_fields_visibility()
 
     # ...................................................... callbacks
 
@@ -504,23 +612,94 @@ class ChannelPanel(QWidget):
 
     # ...................................................... data feed
 
+    def set_history_size(self, n: int):
+        """Resize all rolling buffers to hold *n* samples."""
+        for d in (self.input_data, self.target_out_data,
+                  self.actual_out_data, self.sp_data, self.t_data):
+            new = deque(d, maxlen=n)
+            d.clear()
+            d.extend(new)
+            # deque doesn't support in-place maxlen change, so swap references
+        self.input_data      = deque(self.input_data, maxlen=n)
+        self.target_out_data = deque(self.target_out_data, maxlen=n)
+        self.actual_out_data = deque(self.actual_out_data, maxlen=n)
+        self.sp_data         = deque(self.sp_data, maxlen=n)
+        self.t_data          = deque(self.t_data, maxlen=n)
+
+    def reset_timebase(self):
+        """Clear history and restart the time axis (e.g. on new TCP connection)."""
+        self.input_data.clear()
+        self.target_out_data.clear()
+        self.actual_out_data.clear()
+        self.sp_data.clear()
+        self.t_data.clear()
+        self._sample_count = 0
+        self._t0 = None
+
+    def set_statistics_visible(self, visible: bool):
+        self._stats_visible = visible
+        self.plot_stats.setVisible(visible)
+        if visible:
+            self._refresh_stats_plot()
+
     @Slot(float, float, float, float, int)
     def add_sample(self, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+        now = time.perf_counter()
+        if self._t0 is None:
+            self._t0 = now
+        elapsed = now - self._t0
+        n = self._sample_count
+        if n > 0:
+            dt_avg = elapsed / n
+        else:
+            dt_avg = 0.0
+        self.t_data.append(n * dt_avg)
+        self._sample_count += 1
         self.input_data.append(input_v)
         self.target_out_data.append(target_out_v)
         self.actual_out_data.append(actual_out_v)
         self.sp_data.append(setpoint_v)
-        self.x_data.append(self.sample_idx)
-        self.sample_idx += 1
+
+    def _refresh_stats_plot(self):
+        data = np.asarray(self.input_data, dtype=float)
+        if data.size < 8:
+            self.plot_stats.setTitle(
+                f"Ch{self.ch+1} Input distribution — collect more samples (need ≥8)"
+            )
+            self._bar_item.setOpts(x=[], height=[], width=0.01)
+            self.curve_gauss.setData([], [])
+            return
+        mu = float(np.mean(data))
+        sigma = float(np.std(data, ddof=1)) if data.size > 1 else 0.0
+        if sigma <= 1e-12:
+            sigma = 1e-12
+        nbins = int(np.clip(int(np.sqrt(len(data))), 10, 40))
+        hist, edges = np.histogram(data, bins=nbins)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        width = float(edges[1] - edges[0])
+        self._bar_item.setOpts(
+            x=centers, height=hist, width=width * 0.9, brush="#42A5F5"
+        )
+        xg = np.linspace(mu - 4.0 * sigma, mu + 4.0 * sigma, 200)
+        pdf = (1.0 / (sigma * np.sqrt(2.0 * np.pi))) * np.exp(
+            -0.5 * ((xg - mu) / sigma) ** 2
+        )
+        yg = data.size * width * pdf
+        self.curve_gauss.setData(xg, yg)
+        self.plot_stats.setTitle(
+            f"Ch{self.ch+1} Input: μ={mu:.5f} V  σ={sigma:.5f} V  (N={data.size})"
+        )
 
     def refresh_plots(self):
-        if not self.x_data:
+        if not self.t_data:
             return
-        x = np.array(self.x_data)
+        x = np.array(self.t_data, dtype=float)
         self.curve_input.setData(x, np.array(self.input_data))
         self.curve_sp.setData(x, np.array(self.sp_data))
         self.curve_target_out.setData(x, np.array(self.target_out_data))
         self.curve_actual_out.setData(x, np.array(self.actual_out_data))
+        if self._stats_visible:
+            self._refresh_stats_plot()
 
 
 # ----------------------------------------------------------- Main window
@@ -529,7 +708,7 @@ class MainWindow(QMainWindow):
     def __init__(self, host: str, port: int):
         super().__init__()
         self.setWindowTitle("redPitaLock -- PID Stabilizer Control")
-        self.resize(1100, 700)
+        self.resize(1200, 880)
 
         # Central widget
         central = QWidget()
@@ -561,6 +740,55 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(panel, f"Channel {i + 1}")
         layout.addWidget(self.tabs)
 
+        # Menu bar
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+        self.act_record_start = QAction("Start &recording trace…", self)
+        self.act_record_start.setToolTip(
+            "Append input (photodiode) voltages vs time to a CSV file for stability analysis."
+        )
+        self.act_record_start.triggered.connect(self._start_recording)
+        file_menu.addAction(self.act_record_start)
+        self.act_record_stop = QAction("S&top recording", self)
+        self.act_record_stop.setEnabled(False)
+        self.act_record_stop.triggered.connect(self._stop_recording)
+        file_menu.addAction(self.act_record_stop)
+
+        view_menu = menu_bar.addMenu("&View")
+        self.act_stats = QAction("Input &statistics (histogram)", self)
+        self.act_stats.setCheckable(True)
+        self.act_stats.setToolTip(
+            "Histogram of fast ADC input with Gaussian overlay, mean μ and std σ."
+        )
+        self.act_stats.toggled.connect(self._on_stats_toggled)
+        view_menu.addAction(self.act_stats)
+        view_menu.addSeparator()
+
+        history_widget = QWidget()
+        history_layout = QHBoxLayout(history_widget)
+        history_layout.setContentsMargins(8, 2, 8, 2)
+        history_layout.addWidget(QLabel("History window (s):"))
+        self.sp_history_sec = QDoubleSpinBox()
+        self.sp_history_sec.setRange(1.0, 600.0)
+        self.sp_history_sec.setDecimals(1)
+        self.sp_history_sec.setSingleStep(1.0)
+        self.sp_history_sec.setValue(DEFAULT_HISTORY_SECONDS)
+        self.sp_history_sec.setToolTip(
+            "Length of the rolling plot window in seconds. "
+            "Internally converted to a sample count based on the measured telemetry rate."
+        )
+        self.sp_history_sec.editingFinished.connect(self._on_history_changed)
+        history_layout.addWidget(self.sp_history_sec)
+        history_action = QWidgetAction(self)
+        history_action.setDefaultWidget(history_widget)
+        view_menu.addAction(history_action)
+        self._history_seconds = DEFAULT_HISTORY_SECONDS
+
+        self._record_file = None
+        self._record_writer = None
+        self._record_t0: Optional[float] = None
+        self._last_input: list[Optional[float]] = [None, None]
+
         # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -590,6 +818,7 @@ class MainWindow(QMainWindow):
 
         self.worker = TcpWorker(host, port)
         self.worker.data_received.connect(self._on_data)
+        self.worker.params_received.connect(self._on_params)
         self.worker.autotune_done.connect(self._on_autotune_done)
         self.worker.autotune_failed.connect(self._on_autotune_failed)
         self.worker.autotune_progress.connect(self._on_autotune_progress)
@@ -604,6 +833,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_connected(self):
+        self._last_input = [None, None]
+        for panel in self.channel_panels:
+            panel.reset_timebase()
+        for ch in range(len(self.channel_panels)):
+            self.worker.send_command(f"GET {ch} params")
         self.status.showMessage(
             f"Connected to {self.txt_host.text()}:{self.txt_port.text()}")
         self.btn_connect.setText("Disconnect")
@@ -618,10 +852,91 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.send_command(cmd)
 
+    @Slot(int, dict)
+    def _on_params(self, ch, kv):
+        if 0 <= ch < len(self.channel_panels):
+            self.channel_panels[ch].sync_from_params(kv)
+
     @Slot(int, float, float, float, float, int)
     def _on_data(self, ch, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+        self._last_input[ch] = input_v
+        if self._record_writer is not None and self._record_t0 is not None:
+            t = time.perf_counter() - self._record_t0
+            self._record_writer.writerow(
+                [
+                    f"{t:.6f}",
+                    ""
+                    if self._last_input[0] is None
+                    else f"{self._last_input[0]:.6f}",
+                    ""
+                    if self._last_input[1] is None
+                    else f"{self._last_input[1]:.6f}",
+                ]
+            )
+            self._record_file.flush()
         if 0 <= ch < len(self.channel_panels):
-            self.channel_panels[ch].add_sample(input_v, target_out_v, actual_out_v, setpoint_v, enabled)
+            self.channel_panels[ch].add_sample(
+                input_v, target_out_v, actual_out_v, setpoint_v, enabled
+            )
+
+    @Slot(bool)
+    def _on_stats_toggled(self, checked: bool):
+        for panel in self.channel_panels:
+            panel.set_statistics_visible(checked)
+
+    def _on_history_changed(self):
+        secs = self.sp_history_sec.value()
+        self._history_seconds = secs
+        for panel in self.channel_panels:
+            if panel._t0 is not None and panel._sample_count > 1:
+                elapsed = time.perf_counter() - panel._t0
+                rate = panel._sample_count / elapsed
+            else:
+                rate = 100.0  # fallback: ~100 Hz telemetry
+            n = max(16, int(secs * rate))
+            panel.set_history_size(n)
+        self.status.showMessage(f"History window set to {secs:.1f} s")
+
+    def _start_recording(self):
+        if self._record_writer is not None:
+            self.status.showMessage("Already recording — stop first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save input trace (CSV)",
+            "",
+            "CSV (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            f = open(path, "w", newline="", encoding="utf-8")
+        except OSError as e:
+            self.status.showMessage(f"Could not open file: {e}")
+            return
+        self._record_file = f
+        self._record_writer = csv.writer(f)
+        self._record_writer.writerow(["time_s", "ch0_input_V", "ch1_input_V"])
+        f.flush()
+        self._record_t0 = time.perf_counter()
+        self.act_record_stop.setEnabled(True)
+        self.act_record_start.setEnabled(False)
+        self.status.showMessage(f"Recording input trace to {path}")
+
+    def _stop_recording(self):
+        was = self._record_file is not None
+        if self._record_file is not None:
+            try:
+                self._record_file.close()
+            except OSError:
+                pass
+        self._record_file = None
+        self._record_writer = None
+        self._record_t0 = None
+        self.act_record_stop.setEnabled(False)
+        self.act_record_start.setEnabled(True)
+        if was:
+            self.status.showMessage("Recording stopped")
 
     @Slot(int, float, float, float, float)
     def _on_autotune_done(self, ch, Ku, Tu, Kp, Ki):
@@ -647,6 +962,7 @@ class MainWindow(QMainWindow):
             panel.refresh_plots()
 
     def closeEvent(self, event):
+        self._stop_recording()
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
