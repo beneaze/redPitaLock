@@ -74,4 +74,7 @@
 #define AUTOTUNE_SETTLE_CYCLES   2       /* initial cycles to discard        */
 #define AUTOTUNE_TIMEOUT_S       10.0f   /* abort after this many seconds    */
 
+/* --------------- On-chip PSD (power spectral density) ----------------- */
+#define PSD_N                    2048    /* FFT length (must be power of 2)  */
+
 #endif /* CONFIG_H */

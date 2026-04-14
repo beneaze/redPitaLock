@@ -169,9 +169,11 @@ static void *client_thread(void *arg) {
             telem_counter = 0;
             for (int ch = 0; ch < NUM_CHANNELS; ch++) {
                 channel_state_t *s = &channels[ch];
-                char tbuf[128];
-                snprintf(tbuf, sizeof(tbuf), "D %d %.5f %.5f %.5f %.4f %d\n",
-                         ch, s->telem_input_v, s->telem_output_v,
+                char tbuf[160];
+                snprintf(tbuf, sizeof(tbuf),
+                         "D %d %.6f %.5f %.5f %.5f %.4f %d\n",
+                         ch, s->telem_time_s,
+                         s->telem_input_v, s->telem_output_v,
                          s->telem_actual_output_v,
                          s->setpoint_v, s->enabled);
                 if (send(fd, tbuf, strlen(tbuf), MSG_NOSIGNAL) < 0)
@@ -201,6 +203,33 @@ static void *client_thread(void *arg) {
                     if (send(fd, abuf, strlen(abuf), MSG_NOSIGNAL) < 0)
                         goto done;
                     s->autotune.state = AUTOTUNE_IDLE;
+                }
+
+                /* Send PSD when a new frame is available */
+                if (s->psd_ready) {
+                    char hdr[64];
+                    snprintf(hdr, sizeof(hdr), "PSD %d %d %.1f\n",
+                             ch, PSD_BINS, s->psd_fs);
+                    if (send(fd, hdr, strlen(hdr), MSG_NOSIGNAL) < 0)
+                        goto done;
+                    /* Send bins as space-separated floats on one line.
+                     * Max line ~12 chars/bin * 1025 bins ≈ 12 KB. */
+                    char *pbuf = malloc(PSD_BINS * 14 + 2);
+                    if (pbuf) {
+                        int off = 0;
+                        for (int k = 0; k < PSD_BINS; k++) {
+                            off += snprintf(pbuf + off, 14, "%.6g ",
+                                            (double)s->psd_bins[k]);
+                        }
+                        pbuf[off++] = '\n';
+                        pbuf[off]   = '\0';
+                        if (send(fd, pbuf, (size_t)off, MSG_NOSIGNAL) < 0) {
+                            free(pbuf);
+                            goto done;
+                        }
+                        free(pbuf);
+                    }
+                    s->psd_ready = 0;
                 }
             }
         }

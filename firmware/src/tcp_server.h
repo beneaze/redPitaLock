@@ -4,6 +4,7 @@
 #include "pid.h"
 #include "analog_io.h"
 #include "autotune.h"
+#include "psd.h"
 
 /*
  * Per-channel runtime state shared between the PID thread and the TCP server.
@@ -33,9 +34,15 @@ typedef struct {
     volatile float   autotune_hysteresis;   /* configurable noise band         */
 
     /* --- Telemetry (written by PID thread, read by TCP thread) ---  */
+    volatile double  telem_time_s;         /* CLOCK_MONOTONIC secs since start */
     volatile float   telem_input_v;
     volatile float   telem_output_v;       /* target (pre-clamp)              */
     volatile float   telem_actual_output_v; /* actual (post-clamp, on the DAC) */
+
+    /* --- PSD (written by PID thread, read/cleared by TCP thread) -------- */
+    volatile int     psd_ready;            /* 1 = new PSD frame available     */
+    volatile float   psd_bins[PSD_BINS];   /* one-sided PSD (V^2/Hz)          */
+    volatile float   psd_fs;               /* sample rate for this PSD frame  */
 } channel_state_t;
 
 /* Starts the TCP server on TCP_PORT.  Runs forever (call from a thread).

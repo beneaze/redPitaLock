@@ -58,11 +58,12 @@ class TcpWorker(QThread):
     """Background thread that maintains the TCP connection, parses telemetry,
     and forwards commands from the GUI."""
 
-    data_received = Signal(int, float, float, float, float, int)  # ch, in_v, target_out, actual_out, sp, enabled
-    params_received = Signal(int, dict)                            # ch, {key: value_str, ...}
-    autotune_done = Signal(int, float, float, float, float)       # ch, Ku, Tu, Kp, Ki
-    autotune_failed = Signal(int)                                  # ch
-    autotune_progress = Signal(int, int, int, float)               # ch, crossings, cycles, elapsed_s
+    data_received = Signal(int, float, float, float, float, float, int)  # ch, time_s, in_v, target_out, actual_out, sp, enabled
+    params_received = Signal(int, dict)                                  # ch, {key: value_str, ...}
+    psd_received = Signal(int, int, float, object)                       # ch, n_bins, fs, np.array of PSD bins
+    autotune_done = Signal(int, float, float, float, float)              # ch, Ku, Tu, Kp, Ki
+    autotune_failed = Signal(int)                                        # ch
+    autotune_progress = Signal(int, int, int, float)                     # ch, crossings, cycles, elapsed_s
     connected = Signal()
     disconnected = Signal(str)
 
@@ -122,22 +123,48 @@ class TcpWorker(QThread):
             # Parse all complete lines; keep only the latest sample per channel
             # (server can send 100+ lines per recv — emitting each one floods the GUI).
             latest: dict[int, tuple] = {}
+            pending_psd_hdr = None  # (ch, n_bins, fs) waiting for data line
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
                 line = line.strip()
                 if not line:
                     continue
+
+                # PSD data line (follows a PSD header)
+                if pending_psd_hdr is not None:
+                    p_ch, p_nbins, p_fs = pending_psd_hdr
+                    pending_psd_hdr = None
+                    try:
+                        bins = np.fromstring(line, dtype=float, sep=" ")
+                        if bins.size == p_nbins:
+                            self.psd_received.emit(p_ch, p_nbins, p_fs, bins)
+                    except Exception:
+                        pass
+                    continue
+
                 if line.startswith("D "):
                     parts = line.split()
-                    if len(parts) >= 6:
+                    if len(parts) >= 7:
                         try:
-                            ch = int(parts[1])
-                            iv = float(parts[2])
-                            tgt = float(parts[3])
-                            act = float(parts[4])
-                            sp = float(parts[5])
-                            en = int(parts[6]) if len(parts) > 6 else 0
-                            latest[ch] = (iv, tgt, act, sp, en)
+                            ch  = int(parts[1])
+                            ts  = float(parts[2])
+                            iv  = float(parts[3])
+                            tgt = float(parts[4])
+                            act = float(parts[5])
+                            sp  = float(parts[6])
+                            en  = int(parts[7]) if len(parts) > 7 else 0
+                            latest[ch] = (ts, iv, tgt, act, sp, en)
+                        except (ValueError, IndexError):
+                            pass
+                elif line.startswith("PSD "):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        try:
+                            pending_psd_hdr = (
+                                int(parts[1]),
+                                int(parts[2]),
+                                float(parts[3]),
+                            )
                         except (ValueError, IndexError):
                             pass
                 elif line.startswith("AT "):
@@ -184,8 +211,8 @@ class TcpWorker(QThread):
 
             if latest:
                 for ch in sorted(latest.keys()):
-                    iv, tgt, act, sp, en = latest[ch]
-                    self.data_received.emit(ch, iv, tgt, act, sp, en)
+                    ts, iv, tgt, act, sp, en = latest[ch]
+                    self.data_received.emit(ch, ts, iv, tgt, act, sp, en)
 
         if self._sock:
             self._sock.close()
@@ -205,11 +232,10 @@ class ChannelPanel(QWidget):
         self.target_out_data = deque(maxlen=HISTORY)
         self.actual_out_data = deque(maxlen=HISTORY)
         self.sp_data         = deque(maxlen=HISTORY)
-        self.t_data          = deque(maxlen=HISTORY)  # elapsed time (s) since first sample
-        self._sample_count   = 0
-        self._t0: Optional[float] = None
+        self.t_data          = deque(maxlen=HISTORY)  # server-side timestamp (s)
         self._autotuning     = False
         self._stats_visible  = False
+        self._psd_visible    = False
 
         self._build_ui()
 
@@ -485,9 +511,17 @@ class ChannelPanel(QWidget):
         self.plot_stats.addLegend(offset=(10, 10))
         self.plot_stats.hide()
 
+        self.plot_psd = pg.PlotWidget(title=f"Ch{self.ch+1} Power Spectral Density")
+        self.plot_psd.setLabel("left", "PSD", units="V^2/Hz")
+        self.plot_psd.setLabel("bottom", "Frequency", units="Hz")
+        self.plot_psd.setLogMode(x=True, y=True)
+        self.curve_psd = self.plot_psd.plot(pen=pg.mkPen("#7B1FA2", width=2))
+        self.plot_psd.hide()
+
         plot_layout.addWidget(self.plot_input)
         plot_layout.addWidget(self.plot_output)
         plot_layout.addWidget(self.plot_stats)
+        plot_layout.addWidget(self.plot_psd)
 
         root.addWidget(ctrl_box)
         root.addWidget(plot_widget, stretch=1)
@@ -614,12 +648,6 @@ class ChannelPanel(QWidget):
 
     def set_history_size(self, n: int):
         """Resize all rolling buffers to hold *n* samples."""
-        for d in (self.input_data, self.target_out_data,
-                  self.actual_out_data, self.sp_data, self.t_data):
-            new = deque(d, maxlen=n)
-            d.clear()
-            d.extend(new)
-            # deque doesn't support in-place maxlen change, so swap references
         self.input_data      = deque(self.input_data, maxlen=n)
         self.target_out_data = deque(self.target_out_data, maxlen=n)
         self.actual_out_data = deque(self.actual_out_data, maxlen=n)
@@ -633,8 +661,6 @@ class ChannelPanel(QWidget):
         self.actual_out_data.clear()
         self.sp_data.clear()
         self.t_data.clear()
-        self._sample_count = 0
-        self._t0 = None
 
     def set_statistics_visible(self, visible: bool):
         self._stats_visible = visible
@@ -642,23 +668,27 @@ class ChannelPanel(QWidget):
         if visible:
             self._refresh_stats_plot()
 
-    @Slot(float, float, float, float, int)
-    def add_sample(self, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
-        now = time.perf_counter()
-        if self._t0 is None:
-            self._t0 = now
-        elapsed = now - self._t0
-        n = self._sample_count
-        if n > 0:
-            dt_avg = elapsed / n
-        else:
-            dt_avg = 0.0
-        self.t_data.append(n * dt_avg)
-        self._sample_count += 1
+    def set_psd_visible(self, visible: bool):
+        self._psd_visible = visible
+        self.plot_psd.setVisible(visible)
+
+    @Slot(float, float, float, float, float, int)
+    def add_sample(self, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+        self.t_data.append(time_s)
         self.input_data.append(input_v)
         self.target_out_data.append(target_out_v)
         self.actual_out_data.append(actual_out_v)
         self.sp_data.append(setpoint_v)
+
+    def set_psd_data(self, n_bins: int, fs: float, bins):
+        if not self._psd_visible:
+            return
+        freqs = np.arange(n_bins) * (fs / ((n_bins - 1) * 2))
+        mask = freqs > 0
+        self.curve_psd.setData(freqs[mask], bins[mask])
+        self.plot_psd.setTitle(
+            f"Ch{self.ch+1} PSD  (fs={fs:.0f} Hz, {n_bins} bins)"
+        )
 
     def _refresh_stats_plot(self):
         data = np.asarray(self.input_data, dtype=float)
@@ -762,6 +792,14 @@ class MainWindow(QMainWindow):
         )
         self.act_stats.toggled.connect(self._on_stats_toggled)
         view_menu.addAction(self.act_stats)
+
+        self.act_psd = QAction("Power spectral &density", self)
+        self.act_psd.setCheckable(True)
+        self.act_psd.setToolTip(
+            "On-chip FFT power spectral density (V²/Hz) computed on the Red Pitaya."
+        )
+        self.act_psd.toggled.connect(self._on_psd_toggled)
+        view_menu.addAction(self.act_psd)
         view_menu.addSeparator()
 
         history_widget = QWidget()
@@ -819,6 +857,7 @@ class MainWindow(QMainWindow):
         self.worker = TcpWorker(host, port)
         self.worker.data_received.connect(self._on_data)
         self.worker.params_received.connect(self._on_params)
+        self.worker.psd_received.connect(self._on_psd)
         self.worker.autotune_done.connect(self._on_autotune_done)
         self.worker.autotune_failed.connect(self._on_autotune_failed)
         self.worker.autotune_progress.connect(self._on_autotune_progress)
@@ -857,8 +896,8 @@ class MainWindow(QMainWindow):
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].sync_from_params(kv)
 
-    @Slot(int, float, float, float, float, int)
-    def _on_data(self, ch, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+    @Slot(int, float, float, float, float, float, int)
+    def _on_data(self, ch, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
         self._last_input[ch] = input_v
         if self._record_writer is not None and self._record_t0 is not None:
             t = time.perf_counter() - self._record_t0
@@ -876,23 +915,33 @@ class MainWindow(QMainWindow):
             self._record_file.flush()
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].add_sample(
-                input_v, target_out_v, actual_out_v, setpoint_v, enabled
+                time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled
             )
+
+    @Slot(int, int, float, object)
+    def _on_psd(self, ch, n_bins, fs, bins):
+        if 0 <= ch < len(self.channel_panels):
+            self.channel_panels[ch].set_psd_data(n_bins, fs, bins)
 
     @Slot(bool)
     def _on_stats_toggled(self, checked: bool):
         for panel in self.channel_panels:
             panel.set_statistics_visible(checked)
 
+    @Slot(bool)
+    def _on_psd_toggled(self, checked: bool):
+        for panel in self.channel_panels:
+            panel.set_psd_visible(checked)
+
     def _on_history_changed(self):
         secs = self.sp_history_sec.value()
         self._history_seconds = secs
         for panel in self.channel_panels:
-            if panel._t0 is not None and panel._sample_count > 1:
-                elapsed = time.perf_counter() - panel._t0
-                rate = panel._sample_count / elapsed
+            if len(panel.t_data) >= 2:
+                dt = panel.t_data[-1] - panel.t_data[0]
+                rate = (len(panel.t_data) - 1) / dt if dt > 0 else 100.0
             else:
-                rate = 100.0  # fallback: ~100 Hz telemetry
+                rate = 100.0
             n = max(16, int(secs * rate))
             panel.set_history_size(n)
         self.status.showMessage(f"History window set to {secs:.1f} s")

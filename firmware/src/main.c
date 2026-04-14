@@ -12,6 +12,7 @@
 #include "aom_lut.h"
 #include "analog_io.h"
 #include "autotune.h"
+#include "psd.h"
 #include "tcp_server.h"
 
 static volatile int running = 1;
@@ -44,10 +45,20 @@ static void *pid_thread(void *arg) {
     static int   in_lpf_init[NUM_CHANNELS];
     float wave_phase = 0.0f;
 
-    struct timespec next;
+    psd_state_t psd;
+    psd_init(&psd);
+
+    struct timespec next, t0;
     clock_gettime(CLOCK_MONOTONIC, &next);
+    t0 = next;
 
     while (running) {
+        /* Timestamp relative to thread start */
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        s->telem_time_s = (double)(now_ts.tv_sec - t0.tv_sec)
+                        + (double)(now_ts.tv_nsec - t0.tv_nsec) * 1e-9;
+
         float raw = analog_read(ch, &s->cal);
         if (!in_lpf_init[ch]) {
             in_lpf[ch] = raw;
@@ -110,6 +121,16 @@ static void *pid_thread(void *arg) {
             float actual_v = analog_write_raw(ch, drive_v);
             s->telem_output_v = drive_v;
             s->telem_actual_output_v = actual_v;
+        }
+
+        /* Feed PSD and copy result to shared state when ready */
+        float fs = (dt > 0.0f) ? (1.0f / dt) : 1000.0f;
+        psd_push_sample(&psd, input_v, fs);
+        if (psd.ready) {
+            memcpy((void *)s->psd_bins, psd.out, sizeof(psd.out));
+            s->psd_fs    = psd.fs;
+            s->psd_ready = 1;
+            psd.ready    = 0;
         }
 
         /* Advance to the next period */
