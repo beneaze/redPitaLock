@@ -19,18 +19,21 @@ static void send_line(int fd, const char *line) {
 }
 
 static void send_params(int fd, int ch, const channel_state_t *s) {
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
              "P %d enabled=%d setpoint=%.4f kp=%.4f ki=%.4f kd=%.4f "
              "error_sign=%.1f loop_rate=%d use_lut=%d "
              "in_scale=%.4f in_offset=%.4f out_scale=%.4f out_offset=%.4f "
-             "integral_max=%.4f out_min=%.4f out_max=%.4f\n",
+             "integral_max=%.4f out_min=%.4f out_max=%.4f "
+             "out_mode=%d manual_v=%.4f wave_freq=%.4f wave_amp=%.4f wave_offset=%.4f\n",
              ch, s->enabled, s->setpoint_v,
              s->pid.kp, s->pid.ki, s->pid.kd,
              s->error_sign, s->loop_period_us, s->use_lut,
              s->cal.input_scale, s->cal.input_offset,
              s->cal.output_scale, s->cal.output_offset,
-             s->pid.integral_max, s->pid.out_min, s->pid.out_max);
+             s->pid.integral_max, s->pid.out_min, s->pid.out_max,
+             s->out_mode, s->manual_v, s->wave_freq_hz,
+             s->wave_amplitude, s->wave_offset);
     send_line(fd, buf);
 }
 
@@ -69,6 +72,11 @@ static int handle_command(const char *line, int fd, channel_state_t *channels) {
         else if (strcmp(key, "out_min")    == 0)   s->pid.out_min = val;
         else if (strcmp(key, "out_max")    == 0)   s->pid.out_max = val;
         else if (strcmp(key, "reset")      == 0)   pid_reset(&s->pid);
+        else if (strcmp(key, "out_mode")   == 0)   s->out_mode = (int)val;
+        else if (strcmp(key, "manual_v")   == 0)   s->manual_v = val;
+        else if (strcmp(key, "wave_freq")  == 0)   s->wave_freq_hz = val;
+        else if (strcmp(key, "wave_amp")   == 0)   s->wave_amplitude = val;
+        else if (strcmp(key, "wave_offset") == 0)  s->wave_offset = val;
         else if (strcmp(key, "autotune")  == 0) {
             if ((int)val == 1 && s->enabled && s->autotune.state != AUTOTUNE_RUNNING) {
                 float center = (s->pid.out_min + s->pid.out_max) * 0.5f;

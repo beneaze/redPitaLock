@@ -39,6 +39,18 @@
 #define RP_OUTPUT_MIN           -1.0f
 #define RP_OUTPUT_MAX            1.0f
 
+/* --------------- Manual output / waveform (when PID is off) --------------- */
+/* Output mode: 0 = DC (manual voltage), 1 = triangle, 2 = sine              */
+#define OUT_MODE_DC              0
+#define OUT_MODE_TRIANGLE        1
+#define OUT_MODE_SINE            2
+
+#define DEFAULT_OUT_MODE         OUT_MODE_DC
+#define DEFAULT_MANUAL_V         0.0f
+#define DEFAULT_WAVE_FREQ_HZ     1.0f   /* Hz */
+#define DEFAULT_WAVE_AMPLITUDE   0.5f   /* peak, in volts */
+#define DEFAULT_WAVE_OFFSET      0.0f   /* DC offset, in volts */
+
 /* --------------- AOM LUT -------------------------------------------------- */
 /* Per-channel flag: when true the PID's normalised output (0-1) is passed    */
 /* through aom_linearize() before hitting the DAC.                            */

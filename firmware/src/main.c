@@ -3,6 +3,7 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -27,6 +28,12 @@ typedef struct {
     channel_state_t *state;
 } pid_thread_arg_t;
 
+static float triangle_wave(float phase) {
+    float t = fmodf(phase, 1.0f);
+    if (t < 0.0f) t += 1.0f;
+    return (t < 0.5f) ? (4.0f * t - 1.0f) : (3.0f - 4.0f * t);
+}
+
 static void *pid_thread(void *arg) {
     pid_thread_arg_t *a  = (pid_thread_arg_t *)arg;
     int               ch = a->ch_idx;
@@ -35,6 +42,7 @@ static void *pid_thread(void *arg) {
 
     static float in_lpf[NUM_CHANNELS];
     static int   in_lpf_init[NUM_CHANNELS];
+    float wave_phase = 0.0f;
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -51,8 +59,9 @@ static void *pid_thread(void *arg) {
         float input_v = in_lpf[ch];
         s->telem_input_v = input_v;
 
+        float dt = (float)s->loop_period_us / 1e6f;
+
         if (s->enabled) {
-            float dt = (float)s->loop_period_us / 1e6f;
             float drive_v;
 
             if (s->autotune.state == AUTOTUNE_RUNNING) {
@@ -72,15 +81,35 @@ static void *pid_thread(void *arg) {
                 drive_v = s->use_lut ? aom_linearize(pid_out) : pid_out;
             }
 
+            wave_phase = 0.0f;
             float actual_v = analog_write(ch, drive_v, &s->cal);
             s->telem_output_v = drive_v;
             s->telem_actual_output_v = actual_v;
         } else {
             if (s->autotune.state == AUTOTUNE_RUNNING)
                 s->autotune.state = AUTOTUNE_IDLE;
-            analog_write_raw(ch, 0.0f);
-            s->telem_output_v = 0.0f;
-            s->telem_actual_output_v = 0.0f;
+
+            float drive_v;
+            int mode = s->out_mode;
+
+            if (mode == OUT_MODE_TRIANGLE) {
+                drive_v = s->wave_offset
+                        + s->wave_amplitude * triangle_wave(wave_phase);
+                wave_phase += s->wave_freq_hz * dt;
+                if (wave_phase >= 1.0f) wave_phase -= floorf(wave_phase);
+            } else if (mode == OUT_MODE_SINE) {
+                drive_v = s->wave_offset
+                        + s->wave_amplitude * sinf(2.0f * (float)M_PI * wave_phase);
+                wave_phase += s->wave_freq_hz * dt;
+                if (wave_phase >= 1.0f) wave_phase -= floorf(wave_phase);
+            } else {
+                drive_v = s->manual_v;
+                wave_phase = 0.0f;
+            }
+
+            float actual_v = analog_write_raw(ch, drive_v);
+            s->telem_output_v = drive_v;
+            s->telem_actual_output_v = actual_v;
         }
 
         /* Advance to the next period */
@@ -118,6 +147,12 @@ static void init_channel(channel_state_t *s) {
     s->cal.input_offset  = DEFAULT_INPUT_OFFSET;
     s->cal.output_scale  = DEFAULT_OUTPUT_SCALE;
     s->cal.output_offset = DEFAULT_OUTPUT_OFFSET;
+
+    s->out_mode        = DEFAULT_OUT_MODE;
+    s->manual_v        = DEFAULT_MANUAL_V;
+    s->wave_freq_hz    = DEFAULT_WAVE_FREQ_HZ;
+    s->wave_amplitude  = DEFAULT_WAVE_AMPLITUDE;
+    s->wave_offset     = DEFAULT_WAVE_OFFSET;
 
     pid_init(&s->pid, DEFAULT_KP, DEFAULT_KI, DEFAULT_KD,
              PID_OUT_MIN, PID_OUT_MAX, PID_INTEGRAL_MAX);

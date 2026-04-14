@@ -343,6 +343,72 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(self.btn_autotune, row, 0, 1, 2)
         row += 1
 
+        # --- Manual output / waveform (active when PID is off) ---
+        self.manual_group = QGroupBox("Manual Output (PID off)")
+        manual_layout = QGridLayout()
+        self.manual_group.setLayout(manual_layout)
+        mrow = 0
+
+        manual_layout.addWidget(QLabel("Mode"), mrow, 0)
+        self.cb_out_mode = QComboBox()
+        self.cb_out_mode.addItems(["DC", "Triangle", "Sine"])
+        self.cb_out_mode.currentIndexChanged.connect(self._on_out_mode_changed)
+        manual_layout.addWidget(self.cb_out_mode, mrow, 1)
+        mrow += 1
+
+        manual_layout.addWidget(QLabel("DC voltage (V)"), mrow, 0)
+        self.sp_manual_v = QDoubleSpinBox()
+        self.sp_manual_v.setRange(-1.0, 1.0)
+        self.sp_manual_v.setDecimals(4)
+        self.sp_manual_v.setSingleStep(0.01)
+        self.sp_manual_v.setValue(0.0)
+        self.sp_manual_v.setToolTip("Output voltage when mode is DC and PID is off.")
+        self.sp_manual_v.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} manual_v {self.sp_manual_v.value():.4f}"))
+        manual_layout.addWidget(self.sp_manual_v, mrow, 1)
+        mrow += 1
+
+        manual_layout.addWidget(QLabel("Frequency (Hz)"), mrow, 0)
+        self.sp_wave_freq = QDoubleSpinBox()
+        self.sp_wave_freq.setRange(0.001, 10000.0)
+        self.sp_wave_freq.setDecimals(3)
+        self.sp_wave_freq.setSingleStep(0.1)
+        self.sp_wave_freq.setValue(1.0)
+        self.sp_wave_freq.setToolTip("Waveform frequency for triangle / sine mode.")
+        self.sp_wave_freq.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} wave_freq {self.sp_wave_freq.value():.4f}"))
+        manual_layout.addWidget(self.sp_wave_freq, mrow, 1)
+        mrow += 1
+
+        manual_layout.addWidget(QLabel("Amplitude (V)"), mrow, 0)
+        self.sp_wave_amp = QDoubleSpinBox()
+        self.sp_wave_amp.setRange(0.0, 1.0)
+        self.sp_wave_amp.setDecimals(4)
+        self.sp_wave_amp.setSingleStep(0.01)
+        self.sp_wave_amp.setValue(0.5)
+        self.sp_wave_amp.setToolTip("Peak amplitude of the waveform (V).")
+        self.sp_wave_amp.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} wave_amp {self.sp_wave_amp.value():.4f}"))
+        manual_layout.addWidget(self.sp_wave_amp, mrow, 1)
+        mrow += 1
+
+        manual_layout.addWidget(QLabel("Offset (V)"), mrow, 0)
+        self.sp_wave_offset = QDoubleSpinBox()
+        self.sp_wave_offset.setRange(-1.0, 1.0)
+        self.sp_wave_offset.setDecimals(4)
+        self.sp_wave_offset.setSingleStep(0.01)
+        self.sp_wave_offset.setValue(0.0)
+        self.sp_wave_offset.setToolTip("DC offset added to the waveform (V).")
+        self.sp_wave_offset.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} wave_offset {self.sp_wave_offset.value():.4f}"))
+        manual_layout.addWidget(self.sp_wave_offset, mrow, 1)
+        mrow += 1
+
+        ctrl_layout.addWidget(self.manual_group, row, 0, 1, 2)
+        row += 1
+
+        self._update_manual_fields_visibility()
+
         ctrl_layout.setRowStretch(row, 1)
         ctrl_box.setFixedWidth(280)
 
@@ -384,6 +450,21 @@ class ChannelPanel(QWidget):
     def _on_enable_toggled(self, checked):
         self.btn_enable.setText("PID ON" if checked else "PID OFF")
         self.command.emit(f"SET {self.ch} enabled {int(checked)}")
+        self._update_manual_fields_visibility()
+
+    def _on_out_mode_changed(self, idx):
+        self.command.emit(f"SET {self.ch} out_mode {idx}")
+        self._update_manual_fields_visibility()
+
+    def _update_manual_fields_visibility(self):
+        pid_on = self.btn_enable.isChecked()
+        self.manual_group.setEnabled(not pid_on)
+        mode = self.cb_out_mode.currentIndex()
+        is_wave = mode in (1, 2)
+        self.sp_manual_v.setEnabled(not pid_on and not is_wave)
+        self.sp_wave_freq.setEnabled(not pid_on and is_wave)
+        self.sp_wave_amp.setEnabled(not pid_on and is_wave)
+        self.sp_wave_offset.setEnabled(not pid_on and is_wave)
 
     def _on_sign_changed(self, idx):
         sign = 1.0 if idx == 0 else -1.0

@@ -20,6 +20,13 @@ typedef struct {
     pid_state_t      pid;             /* gains modified via tcp SET commands  */
     analog_cal_t     cal;
 
+    /* --- Manual output / waveform (active when PID is off) -------------- */
+    volatile int     out_mode;        /* OUT_MODE_DC / TRIANGLE / SINE       */
+    volatile float   manual_v;        /* DC voltage when out_mode == DC      */
+    volatile float   wave_freq_hz;    /* waveform frequency (Hz)             */
+    volatile float   wave_amplitude;  /* waveform peak amplitude (V)         */
+    volatile float   wave_offset;     /* waveform DC offset (V)              */
+
     /* --- Autotune --------------------------------------------------------- */
     autotune_state_t autotune;
     volatile float   autotune_relay_amp;    /* configurable relay amplitude    */
