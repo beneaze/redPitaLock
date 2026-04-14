@@ -10,6 +10,7 @@
 #include "pid.h"
 #include "aom_lut.h"
 #include "analog_io.h"
+#include "autotune.h"
 #include "tcp_server.h"
 
 static volatile int running = 1;
@@ -52,13 +53,31 @@ static void *pid_thread(void *arg) {
 
         if (s->enabled) {
             float dt = (float)s->loop_period_us / 1e6f;
-            float pid_out = pid_update(&s->pid, s->setpoint_v, input_v,
-                                       dt, s->error_sign);
-            float drive_v = s->use_lut ? aom_linearize(pid_out) : pid_out;
+            float drive_v;
+
+            if (s->autotune.state == AUTOTUNE_RUNNING) {
+                drive_v = autotune_step(&s->autotune, s->setpoint_v,
+                                        input_v, dt);
+                if (s->autotune.state == AUTOTUNE_DONE) {
+                    s->pid.kp = s->autotune.Kp;
+                    s->pid.ki = s->autotune.Ki;
+                    s->pid.kd = 0.0f;
+                    pid_reset(&s->pid);
+                } else if (s->autotune.state == AUTOTUNE_FAILED) {
+                    pid_reset(&s->pid);
+                }
+            } else {
+                float pid_out = pid_update(&s->pid, s->setpoint_v, input_v,
+                                           dt, s->error_sign);
+                drive_v = s->use_lut ? aom_linearize(pid_out) : pid_out;
+            }
+
             float actual_v = analog_write(ch, drive_v, &s->cal);
             s->telem_output_v = drive_v;
             s->telem_actual_output_v = actual_v;
         } else {
+            if (s->autotune.state == AUTOTUNE_RUNNING)
+                s->autotune.state = AUTOTUNE_IDLE;
             analog_write_raw(ch, 0.0f);
             s->telem_output_v = 0.0f;
             s->telem_actual_output_v = 0.0f;
@@ -102,12 +121,17 @@ static void init_channel(channel_state_t *s) {
 
     pid_init(&s->pid, DEFAULT_KP, DEFAULT_KI, DEFAULT_KD,
              PID_OUT_MIN, PID_OUT_MAX, PID_INTEGRAL_MAX);
+
+    s->autotune.state       = AUTOTUNE_IDLE;
+    s->autotune_relay_amp   = AUTOTUNE_RELAY_AMP;
+    s->autotune_hysteresis  = AUTOTUNE_HYSTERESIS;
 }
 
 int main(void) {
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
+    setvbuf(stdout, NULL, _IOLBF, 0);
     printf("redPitaLock v1.0 -- two-channel PID stabilizer\n");
 
     /* Initialise analog I/O (librp) */

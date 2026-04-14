@@ -39,6 +39,9 @@ class TcpWorker(QThread):
     and forwards commands from the GUI."""
 
     data_received = Signal(int, float, float, float, float, int)  # ch, in_v, target_out, actual_out, sp, enabled
+    autotune_done = Signal(int, float, float, float, float)       # ch, Ku, Tu, Kp, Ki
+    autotune_failed = Signal(int)                                  # ch
+    autotune_progress = Signal(int, int, int, float)               # ch, crossings, cycles, elapsed_s
     connected = Signal()
     disconnected = Signal(str)
 
@@ -116,6 +119,34 @@ class TcpWorker(QThread):
                             latest[ch] = (iv, tgt, act, sp, en)
                         except (ValueError, IndexError):
                             pass
+                elif line.startswith("AT "):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        try:
+                            self.autotune_progress.emit(
+                                int(parts[1]), int(parts[2]),
+                                int(parts[3]), float(parts[4]))
+                        except (ValueError, IndexError):
+                            pass
+                elif line.startswith("AF "):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            self.autotune_failed.emit(int(parts[1]))
+                        except (ValueError, IndexError):
+                            pass
+                elif line.startswith("A "):
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        try:
+                            ch = int(parts[1])
+                            Ku = float(parts[2])
+                            Tu = float(parts[3])
+                            Kp = float(parts[4])
+                            Ki = float(parts[5])
+                            self.autotune_done.emit(ch, Ku, Tu, Kp, Ki)
+                        except (ValueError, IndexError):
+                            pass
 
             if latest:
                 for ch in sorted(latest.keys()):
@@ -142,6 +173,7 @@ class ChannelPanel(QWidget):
         self.sp_data         = deque(maxlen=HISTORY)
         self.x_data          = deque(maxlen=HISTORY)
         self.sample_idx      = 0
+        self._autotuning     = False
 
         self._build_ui()
 
@@ -286,6 +318,31 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(btn_reset, row, 0, 1, 2)
         row += 1
 
+        # Autotune relay amplitude
+        ctrl_layout.addWidget(QLabel("Autotune amp (V)"), row, 0)
+        self.sp_at_amp = QDoubleSpinBox()
+        self.sp_at_amp.setRange(0.01, 1.0)
+        self.sp_at_amp.setDecimals(3)
+        self.sp_at_amp.setSingleStep(0.05)
+        self.sp_at_amp.setValue(0.50)
+        self.sp_at_amp.setToolTip(
+            "Half-amplitude of the relay output during autotune. "
+            "With out_min=0 and out_max=1, amp=0.5 uses the full range [0,1]."
+        )
+        self.sp_at_amp.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} autotune_amp {self.sp_at_amp.value():.4f}"))
+        ctrl_layout.addWidget(self.sp_at_amp, row, 1)
+        row += 1
+
+        # Autotune button
+        self.btn_autotune = QPushButton("Autotune")
+        self.btn_autotune.setStyleSheet(
+            "QPushButton { background-color: #1565C0; color: white; font-weight: bold; padding: 8px; }"
+        )
+        self.btn_autotune.clicked.connect(self._on_autotune_clicked)
+        ctrl_layout.addWidget(self.btn_autotune, row, 0, 1, 2)
+        row += 1
+
         ctrl_layout.setRowStretch(row, 1)
         ctrl_box.setFixedWidth(280)
 
@@ -331,6 +388,38 @@ class ChannelPanel(QWidget):
     def _on_sign_changed(self, idx):
         sign = 1.0 if idx == 0 else -1.0
         self.command.emit(f"SET {self.ch} error_sign {sign:.1f}")
+
+    def _on_autotune_clicked(self):
+        if self._autotuning:
+            self._autotuning = False
+            self.btn_autotune.setText("Autotune")
+            self.command.emit(f"SET {self.ch} autotune 0")
+            return
+        if not self.btn_enable.isChecked():
+            return
+        self._autotuning = True
+        self.btn_autotune.setText("Cancel Autotune")
+        self.command.emit(f"SET {self.ch} autotune 1")
+
+    @Slot(float, float, float, float)
+    def on_autotune_done(self, Ku, Tu, Kp, Ki):
+        self._autotuning = False
+        self.sp_kp.setValue(Kp)
+        self.sp_ki.setValue(Ki)
+        self.sp_kd.setValue(0.0)
+        self.btn_autotune.setText("Autotune")
+        return Ku, Tu
+
+    @Slot()
+    def on_autotune_failed(self):
+        self._autotuning = False
+        self.btn_autotune.setText("Autotune")
+
+    @Slot(int, int, float)
+    def on_autotune_progress(self, crossings, cycles, elapsed):
+        if self._autotuning:
+            self.btn_autotune.setText(
+                f"Cancel ({crossings} cross, {cycles} cyc, {elapsed:.0f}s)")
 
     # ...................................................... data feed
 
@@ -420,6 +509,9 @@ class MainWindow(QMainWindow):
 
         self.worker = TcpWorker(host, port)
         self.worker.data_received.connect(self._on_data)
+        self.worker.autotune_done.connect(self._on_autotune_done)
+        self.worker.autotune_failed.connect(self._on_autotune_failed)
+        self.worker.autotune_progress.connect(self._on_autotune_progress)
         self.worker.connected.connect(self._on_connected)
         self.worker.disconnected.connect(self._on_disconnected)
 
@@ -449,6 +541,25 @@ class MainWindow(QMainWindow):
     def _on_data(self, ch, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].add_sample(input_v, target_out_v, actual_out_v, setpoint_v, enabled)
+
+    @Slot(int, float, float, float, float)
+    def _on_autotune_done(self, ch, Ku, Tu, Kp, Ki):
+        if 0 <= ch < len(self.channel_panels):
+            self.channel_panels[ch].on_autotune_done(Ku, Tu, Kp, Ki)
+            self.status.showMessage(
+                f"Ch{ch+1} autotune complete: Ku={Ku:.4f} Tu={Tu:.4f}s  →  Kp={Kp:.4f} Ki={Ki:.4f}")
+
+    @Slot(int)
+    def _on_autotune_failed(self, ch):
+        if 0 <= ch < len(self.channel_panels):
+            self.channel_panels[ch].on_autotune_failed()
+            self.status.showMessage(
+                f"Ch{ch+1} autotune FAILED (timeout) — try increasing relay amplitude or check setpoint")
+
+    @Slot(int, int, int, float)
+    def _on_autotune_progress(self, ch, crossings, cycles, elapsed):
+        if 0 <= ch < len(self.channel_panels):
+            self.channel_panels[ch].on_autotune_progress(crossings, cycles, elapsed)
 
     def _refresh_plots(self):
         for panel in self.channel_panels:

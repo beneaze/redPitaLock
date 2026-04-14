@@ -69,6 +69,22 @@ static int handle_command(const char *line, int fd, channel_state_t *channels) {
         else if (strcmp(key, "out_min")    == 0)   s->pid.out_min = val;
         else if (strcmp(key, "out_max")    == 0)   s->pid.out_max = val;
         else if (strcmp(key, "reset")      == 0)   pid_reset(&s->pid);
+        else if (strcmp(key, "autotune")  == 0) {
+            if ((int)val == 1 && s->enabled && s->autotune.state != AUTOTUNE_RUNNING) {
+                float center = (s->pid.out_min + s->pid.out_max) * 0.5f;
+                float half   = (s->pid.out_max - s->pid.out_min) * 0.5f;
+                float amp    = (s->autotune_relay_amp < half)
+                             ?  s->autotune_relay_amp : half;
+                autotune_init(&s->autotune, amp, center,
+                              s->autotune_hysteresis, s->error_sign,
+                              AUTOTUNE_MIN_CYCLES, AUTOTUNE_SETTLE_CYCLES,
+                              AUTOTUNE_TIMEOUT_S);
+            } else if ((int)val == 0) {
+                s->autotune.state = AUTOTUNE_IDLE;
+            }
+        }
+        else if (strcmp(key, "autotune_amp") == 0)  s->autotune_relay_amp = val;
+        else if (strcmp(key, "autotune_hyst") == 0) s->autotune_hysteresis = val;
         else return -1;
 
         send_line(fd, "OK\n");
@@ -152,6 +168,32 @@ static void *client_thread(void *arg) {
                          s->setpoint_v, s->enabled);
                 if (send(fd, tbuf, strlen(tbuf), MSG_NOSIGNAL) < 0)
                     goto done;
+
+                if (s->autotune.state == AUTOTUNE_RUNNING) {
+                    char atbuf[96];
+                    snprintf(atbuf, sizeof(atbuf),
+                             "AT %d %d %d %.1f\n",
+                             ch, s->autotune.half_cycle_count,
+                             s->autotune.n_measured,
+                             s->autotune.elapsed);
+                    if (send(fd, atbuf, strlen(atbuf), MSG_NOSIGNAL) < 0)
+                        goto done;
+                } else if (s->autotune.state == AUTOTUNE_DONE) {
+                    char abuf[128];
+                    snprintf(abuf, sizeof(abuf),
+                             "A %d %.6f %.6f %.6f %.6f\n",
+                             ch, s->autotune.Ku, s->autotune.Tu,
+                             s->autotune.Kp, s->autotune.Ki);
+                    if (send(fd, abuf, strlen(abuf), MSG_NOSIGNAL) < 0)
+                        goto done;
+                    s->autotune.state = AUTOTUNE_IDLE;
+                } else if (s->autotune.state == AUTOTUNE_FAILED) {
+                    char abuf[64];
+                    snprintf(abuf, sizeof(abuf), "AF %d\n", ch);
+                    if (send(fd, abuf, strlen(abuf), MSG_NOSIGNAL) < 0)
+                        goto done;
+                    s->autotune.state = AUTOTUNE_IDLE;
+                }
             }
         }
     }

@@ -3,6 +3,7 @@
 
 #include "pid.h"
 #include "analog_io.h"
+#include "autotune.h"
 
 /*
  * Per-channel runtime state shared between the PID thread and the TCP server.
@@ -18,6 +19,11 @@ typedef struct {
     volatile int     use_lut;
     pid_state_t      pid;             /* gains modified via tcp SET commands  */
     analog_cal_t     cal;
+
+    /* --- Autotune --------------------------------------------------------- */
+    autotune_state_t autotune;
+    volatile float   autotune_relay_amp;    /* configurable relay amplitude    */
+    volatile float   autotune_hysteresis;   /* configurable noise band         */
 
     /* --- Telemetry (written by PID thread, read by TCP thread) ---  */
     volatile float   telem_input_v;

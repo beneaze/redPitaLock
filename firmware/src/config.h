@@ -55,4 +55,11 @@
 /* First-order LPF on ADC before PID: y += alpha*(raw-y). Higher = faster, noisier. */
 #define INPUT_LPF_ALPHA          0.20f
 
+/* --------------- Autotune (relay-feedback, Astrom-Hagglund) --------------- */
+#define AUTOTUNE_RELAY_AMP       0.50f   /* relay output half-amplitude (V)  */
+#define AUTOTUNE_HYSTERESIS      0.005f  /* noise band around setpoint (V)   */
+#define AUTOTUNE_MIN_CYCLES      5       /* full cycles to average           */
+#define AUTOTUNE_SETTLE_CYCLES   2       /* initial cycles to discard        */
+#define AUTOTUNE_TIMEOUT_S       10.0f   /* abort after this many seconds    */
+
 #endif /* CONFIG_H */

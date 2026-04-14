@@ -60,10 +60,13 @@ flowchart LR
 - **Two independent PID channels** using 14-bit, 125 MS/s fast analog I/O
 - Both channels **disabled by default** -- enable from the GUI
 - Adjustable PID gains (Kp, Ki, Kd), setpoint, loop rate, and error sign
+- **One-click PID autotune** using relay-feedback (Astrom-Hagglund) method
+- Derivative on measurement (not error) to avoid noise amplification
+- First-order low-pass filter on ADC input before PID
 - Optional AOM linearization lookup table per channel
-- Configurable input/output scale and offset for analog signal conditioning
+- Configurable PID output limits (out_min / out_max)
 - Anti-windup integral clamping
-- Real-time plots of input voltage and output voltage (pyqtgraph, ~100 Hz)
+- Real-time plots of input voltage, target output, and actual output (pyqtgraph, ~100 Hz)
 - Simple text-based TCP protocol (debuggable with `telnet`)
 
 ## Repository Structure
@@ -76,6 +79,7 @@ redPitaLock/
 │       ├── main.c            # Daemon: two RT PID threads + TCP server
 │       ├── config.h          # Default parameters (gains, rates, scaling)
 │       ├── pid.c / pid.h     # PID algorithm with anti-windup
+│       ├── autotune.c / .h   # Relay-feedback autotune (Astrom-Hagglund)
 │       ├── aom_lut.c / .h    # AOM drive linearization lookup table
 │       ├── analog_io.c / .h  # librp fast analog I/O abstraction
 │       └── tcp_server.c / .h # Telemetry streaming + command parser
@@ -185,7 +189,10 @@ python monitor_rp.py rp-XXXX.local 5000  # explicit host + port
 | **Loop period (us)** | Control loop update interval |
 | **Error sign** | +1 (normal) or -1 (inverted feedback) |
 | **AOM linearization** | Enable/disable the AOM drive lookup table |
+| **PID out min / max (V)** | Output clamp range for the PID controller |
 | **Reset PID integrator** | Zero the integral accumulator |
+| **Autotune amp (V)** | Relay half-amplitude for autotune excitation |
+| **Autotune** | Start/cancel relay-feedback autotune; shows live progress |
 
 ## TCP Protocol
 
@@ -195,13 +202,18 @@ to debug.
 ### Telemetry (server -> client, ~100 Hz)
 
 ```
-D <ch> <input_V> <output_V> <setpoint_V> <enabled>
+D <ch> <input_V> <target_out_V> <actual_out_V> <setpoint_V> <enabled>
+AT <ch> <crossings> <measured_cycles> <elapsed_s>    # while autotune is running
+A <ch> <Ku> <Tu> <Kp> <Ki>                           # autotune completed
+AF <ch>                                               # autotune failed (timeout)
 ```
 
 Example:
 ```
-D 0 1.4832 0.7521 1.5000 1
-D 1 0.3210 0.0000 0.5000 0
+D 0 0.4832 0.7521 0.7521 0.5000 1
+D 1 0.3210 0.0000 0.0000 0.5000 0
+AT 0 4 1 2.3
+A 0 12.3456 0.0234 5.5555 284.3210
 ```
 
 ### Commands (client -> server)
@@ -220,24 +232,49 @@ SET <ch> in_scale 3.3           # input calibration scale
 SET <ch> in_offset 0.0          # input calibration offset
 SET <ch> out_scale 1.0          # output calibration scale
 SET <ch> out_offset 0.0         # output calibration offset
+SET <ch> out_min 0.0            # minimum PID output (V)
+SET <ch> out_max 1.0            # maximum PID output (V)
 SET <ch> reset 0                # reset PID integrator
+SET <ch> autotune 1             # start relay-feedback autotune
+SET <ch> autotune 0             # cancel autotune
+SET <ch> autotune_amp 0.5       # relay half-amplitude (V)
+SET <ch> autotune_hyst 0.005    # hysteresis band (V)
 GET <ch> params                 # query all parameters
 ```
 
 ## PID Algorithm
 
-The PID controller is identical to the original stabilizerPi implementation:
-
 - **P term:** `Kp * error`
 - **I term:** `Ki * integral`, with clamping to `+/-integral_max` and
   anti-windup (integral freezes when output saturates in the same direction
   as the error)
-- **D term:** `Kd * (error - prev_error) / dt`
-- **Output** clamped to `[out_min, out_max]` (default 0-1 normalized)
+- **D term:** `Kd * d(measurement)/dt` (derivative on measurement, not error,
+  to avoid kick on setpoint changes and reduce noise amplification)
+- **Input filter:** first-order IIR low-pass on ADC before PID (`INPUT_LPF_ALPHA`)
+- **Output** clamped to `[out_min, out_max]` (default 0-1 V)
 
 When the AOM LUT is enabled, the normalized 0-1 PID output is mapped through
 a 13-point piecewise-linear curve to the physical AOM drive voltage
 (~0.18-1.25 V).
+
+## Autotune
+
+The autotune uses the **Astrom-Hagglund relay-feedback** method:
+
+1. Enable PID and set a valid setpoint
+2. Click **Autotune** -- the PID is temporarily replaced by a bang-bang relay
+3. The relay forces the output to oscillate around the setpoint, swinging
+   between `center + amp` and `center - amp` (center = midpoint of out_min/out_max)
+4. After discarding 2 settle cycles, the firmware measures the oscillation
+   period (Tu) and peak-to-peak amplitude (a) over 5 full cycles
+5. Ultimate gain and PI gains are computed:
+   - `Ku = 4d / (pi * a)` where d = relay amplitude
+   - `Kp = 0.45 * Ku`, `Ki = 0.54 * Ku / Tu`
+6. Gains are written into the PID and normal control resumes
+7. The GUI spinboxes update automatically with the computed gains
+
+The autotune respects `error_sign` so it works with both normal and inverted
+plant polarity. A 10-second timeout aborts if no oscillation is detected.
 
 ## Origin
 
