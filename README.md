@@ -7,6 +7,8 @@ The system reads photodiode signals on the Red Pitaya's fast analog inputs
 (IN1, IN2) and outputs corrective voltages on the fast analog outputs
 (OUT1, OUT2) to stabilize laser intensity through an AOM or similar actuator.
 
+![GUI screenshot showing PID control, real-time plots, input statistics, and power spectral density](docs/gui_screenshot.png)
+
 ```mermaid
 flowchart TB
     subgraph RP["Red Pitaya STEMlab 125-14 &ensp;(rp-XXXX.local)"]
@@ -60,13 +62,14 @@ flowchart LR
 - **Two independent PID channels** using 14-bit, 125 MS/s fast analog I/O
 - Both channels **disabled by default** -- enable from the GUI
 - Adjustable PID gains (Kp, Ki, Kd), setpoint, loop rate, and error sign
-- **One-click PID autotune** using relay-feedback (Astrom-Hagglund) method
+- **One-click PID autotune** using relay-feedback (Astrom-Hagglund) with Tyreus-Luyben tuning rules
 - Derivative on measurement (not error) to avoid noise amplification
 - First-order low-pass filter on ADC input before PID
 - Optional AOM linearization lookup table per channel
 - Configurable PID output limits (out_min / out_max)
 - Anti-windup integral clamping
-- Real-time plots of input voltage, target output, and actual output (pyqtgraph, ~100 Hz)
+- **Fast power spectral density** (PSD) from 125 MS/s ADC bulk-read with Welch averaging, showing RMS noise, fractional stability, and gate error metrics
+- Real-time plots of input voltage, target output, actual output, input distribution, and PSD (pyqtgraph, ~100 Hz)
 - Simple text-based TCP protocol (debuggable with `telnet`)
 
 ## Repository Structure
@@ -80,6 +83,7 @@ redPitaLock/
 │       ├── config.h          # Default parameters (gains, rates, scaling)
 │       ├── pid.c / pid.h     # PID algorithm with anti-windup
 │       ├── autotune.c / .h   # Relay-feedback autotune (Astrom-Hagglund)
+│       ├── psd.c / psd.h     # On-chip PSD via FFT (Welch averaging)
 │       ├── aom_lut.c / .h    # AOM drive linearization lookup table
 │       ├── analog_io.c / .h  # librp fast analog I/O abstraction
 │       └── tcp_server.c / .h # Telemetry streaming + command parser
@@ -204,7 +208,7 @@ to debug.
 ```
 D <ch> <input_V> <target_out_V> <actual_out_V> <setpoint_V> <enabled>
 AT <ch> <crossings> <measured_cycles> <elapsed_s>    # while autotune is running
-A <ch> <Ku> <Tu> <Kp> <Ki>                           # autotune completed
+A <ch> <Ku> <Tu> <Kp> <Ki> <Kd>                       # autotune completed
 AF <ch>                                               # autotune failed (timeout)
 ```
 
@@ -213,7 +217,7 @@ Example:
 D 0 0.4832 0.7521 0.7521 0.5000 1
 D 1 0.3210 0.0000 0.0000 0.5000 0
 AT 0 4 1 2.3
-A 0 12.3456 0.0234 5.5555 284.3210
+A 0 12.3456 0.0234 5.5555 284.3210 0.000744
 ```
 
 ### Commands (client -> server)
@@ -264,17 +268,17 @@ The autotune uses the **Astrom-Hagglund relay-feedback** method:
 1. Enable PID and set a valid setpoint
 2. Click **Autotune** -- the PID is temporarily replaced by a bang-bang relay
 3. The relay forces the output to oscillate around the setpoint, swinging
-   between `center + amp` and `center - amp` (center = midpoint of out_min/out_max)
-4. After discarding 2 settle cycles, the firmware measures the oscillation
-   period (Tu) and peak-to-peak amplitude (a) over 5 full cycles
-5. Ultimate gain and PI gains are computed:
+   between `center + amp` and `center - amp` (center = current output voltage)
+4. After discarding 1 settle cycle, the firmware measures the oscillation
+   period (Tu) and peak-to-peak amplitude (a) over 3 full cycles
+5. Ultimate gain and PID gains are computed using **Tyreus-Luyben** rules:
    - `Ku = 4d / (pi * a)` where d = relay amplitude
-   - `Kp = 0.45 * Ku`, `Ki = 0.54 * Ku / Tu`
+   - `Kp = Ku / 3.2`, `Ki = Ku / (7.04 * Tu)`, `Kd = Ku * Tu / 13.86`
 6. Gains are written into the PID and normal control resumes
 7. The GUI spinboxes update automatically with the computed gains
 
 The autotune respects `error_sign` so it works with both normal and inverted
-plant polarity. A 10-second timeout aborts if no oscillation is detected.
+plant polarity. A 30-second timeout aborts if no oscillation is detected.
 
 ## Origin
 
