@@ -3,17 +3,31 @@
 
 #include "config.h"
 
-#define PSD_BINS  (PSD_N / 2 + 1)   /* one-sided spectrum: 0 .. N/2 inclusive */
-
 typedef struct {
-    float  buf[PSD_N];              /* sample ring buffer                     */
-    int    fill;                    /* samples collected so far (0..PSD_N)    */
-    float  out[PSD_BINS];           /* latest PSD result (V^2/Hz)             */
-    float  fs;                      /* sample rate used for this frame (Hz)   */
-    int    ready;                   /* 1 = new PSD available, cleared by reader */
+    float  accum[PSD_BINS];  /* running sum of |X[k]|^2 (unnormalised)      */
+    float  out[PSD_BINS];    /* latest averaged PSD result (V^2/Hz)         */
+    float *work_re;          /* FFT workspace, PSD_N floats (heap)          */
+    float *work_im;          /* FFT workspace, PSD_N floats (heap)          */
+    float  fs;               /* sample rate for this PSD frame (Hz)         */
+    int    avg_count;        /* segments accumulated so far                 */
+    int    ready;            /* 1 = new averaged PSD available              */
 } psd_state_t;
 
-void  psd_init(psd_state_t *p);
-void  psd_push_sample(psd_state_t *p, float sample, float fs);
+/* Returns 0 on success, -1 if allocation fails. */
+int  psd_init(psd_state_t *p);
+void psd_free(psd_state_t *p);
+
+/*
+ * Process one buffer of PSD_N time-domain samples:
+ *   - apply Hann window
+ *   - radix-2 FFT
+ *   - accumulate |X[k]|^2 into accum[]
+ *   - when avg_count reaches avg_target, normalise to V^2/Hz and set ready=1
+ *
+ * `buf` must contain PSD_N floats (voltages).
+ * `fs`  is the effective sample rate (Hz).
+ */
+void psd_process_buffer(psd_state_t *p, const float *buf, float fs,
+                        int avg_target);
 
 #endif /* PSD_H */

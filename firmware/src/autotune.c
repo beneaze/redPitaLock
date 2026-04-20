@@ -30,6 +30,7 @@ void autotune_init(autotune_state_t *at, float relay_amp, float relay_center,
     at->Tu = 0.0f;
     at->Kp = 0.0f;
     at->Ki = 0.0f;
+    at->Kd = 0.0f;
 
     /* Memory barrier: ensure all fields above are visible before the PID
      * thread sees state == RUNNING.                                          */
@@ -120,12 +121,14 @@ float autotune_step(autotune_state_t *at, float setpoint, float measurement,
             else
                 at->Ku = 0.0f;
 
-            /* Ziegler-Nichols PI rules */
-            at->Kp = 0.45f * at->Ku;
-            at->Ki = (at->Tu > 1e-9f) ? (0.54f * at->Ku / at->Tu) : 0.0f;
+            /* Tyreus-Luyben PI rules (conservative, good for fast digital loops).
+             * Kd is computed for reference but not auto-applied.              */
+            at->Kp = at->Ku / 3.2f;
+            at->Ki = (at->Tu > 1e-9f) ? (at->Ku / (7.04f * at->Tu)) : 0.0f;
+            at->Kd = at->Ku * at->Tu / 13.86f;
 
-            printf("[autotune] DONE: Ku=%.4f Tu=%.4fs -> Kp=%.4f Ki=%.4f\n",
-                   at->Ku, at->Tu, at->Kp, at->Ki);
+            printf("[autotune] DONE: Ku=%.4f Tu=%.4fs -> Kp=%.4f Ki=%.4f Kd=%.6f\n",
+                   at->Ku, at->Tu, at->Kp, at->Ki, at->Kd);
             at->state = AUTOTUNE_DONE;
         }
     }

@@ -1,6 +1,8 @@
 #ifndef ANALOG_IO_H
 #define ANALOG_IO_H
 
+#include <stdint.h>
+
 /*
  * Red Pitaya fast analog I/O abstraction.
  *
@@ -35,6 +37,11 @@ float analog_read_raw(int ch);
  * `voltage` is clamped to the hardware range (-1 .. +1 V).
  * Returns the actual clamped voltage that was written.                       */
 float analog_write_raw(int ch, float voltage);
+
+/* Bulk-read the most recent `n` samples from the FPGA acquisition buffer.
+ * Samples are at the full ADC rate (125 MS/s with RP_DEC_1).
+ * Returns the number of samples actually read.                               */
+uint32_t analog_read_bulk(int ch, float *buf, uint32_t n);
 
 /* Convenience wrappers that apply calibration.
  * analog_write returns the actual physical voltage after clamping.           */

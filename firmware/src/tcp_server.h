@@ -39,10 +39,12 @@ typedef struct {
     volatile float   telem_output_v;       /* target (pre-clamp)              */
     volatile float   telem_actual_output_v; /* actual (post-clamp, on the DAC) */
 
-    /* --- PSD (written by PID thread, read/cleared by TCP thread) -------- */
+    /* --- PSD (written by PSD thread, read/cleared by TCP thread) -------- */
     volatile int     psd_ready;            /* 1 = new PSD frame available     */
     volatile float   psd_bins[PSD_BINS];   /* one-sided PSD (V^2/Hz)          */
     volatile float   psd_fs;               /* sample rate for this PSD frame  */
+    volatile int     psd_avg;              /* Welch segments to average        */
+    volatile int     psd_interval_ms;      /* ms between PSD updates           */
 } channel_state_t;
 
 /* Starts the TCP server on TCP_PORT.  Runs forever (call from a thread).

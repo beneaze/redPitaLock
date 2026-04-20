@@ -61,7 +61,7 @@ class TcpWorker(QThread):
     data_received = Signal(int, float, float, float, float, float, int)  # ch, time_s, in_v, target_out, actual_out, sp, enabled
     params_received = Signal(int, dict)                                  # ch, {key: value_str, ...}
     psd_received = Signal(int, int, float, object)                       # ch, n_bins, fs, np.array of PSD bins
-    autotune_done = Signal(int, float, float, float, float)              # ch, Ku, Tu, Kp, Ki
+    autotune_done = Signal(int, float, float, float, float, float)        # ch, Ku, Tu, Kp, Ki, Kd
     autotune_failed = Signal(int)                                        # ch
     autotune_progress = Signal(int, int, int, float)                     # ch, crossings, cycles, elapsed_s
     connected = Signal()
@@ -96,6 +96,7 @@ class TcpWorker(QThread):
             return
 
         buf = ""
+        pending_psd_hdr = None
 
         while self._running:
             # Send queued commands
@@ -109,7 +110,7 @@ class TcpWorker(QThread):
 
             # Read telemetry
             try:
-                data = self._sock.recv(65536)
+                data = self._sock.recv(262144)
                 if not data:
                     self.disconnected.emit("server closed connection")
                     return
@@ -123,7 +124,6 @@ class TcpWorker(QThread):
             # Parse all complete lines; keep only the latest sample per channel
             # (server can send 100+ lines per recv — emitting each one floods the GUI).
             latest: dict[int, tuple] = {}
-            pending_psd_hdr = None  # (ch, n_bins, fs) waiting for data line
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
                 line = line.strip()
@@ -198,14 +198,15 @@ class TcpWorker(QThread):
                             pass
                 elif line.startswith("A "):
                     parts = line.split()
-                    if len(parts) >= 6:
+                    if len(parts) >= 7:
                         try:
                             ch = int(parts[1])
                             Ku = float(parts[2])
                             Tu = float(parts[3])
                             Kp = float(parts[4])
                             Ki = float(parts[5])
-                            self.autotune_done.emit(ch, Ku, Tu, Kp, Ki)
+                            Kd = float(parts[6])
+                            self.autotune_done.emit(ch, Ku, Tu, Kp, Ki, Kd)
                         except (ValueError, IndexError):
                             pass
 
@@ -233,6 +234,7 @@ class ChannelPanel(QWidget):
         self.actual_out_data = deque(maxlen=HISTORY)
         self.sp_data         = deque(maxlen=HISTORY)
         self.t_data          = deque(maxlen=HISTORY)  # server-side timestamp (s)
+        self._t0             = None
         self._autotuning     = False
         self._stats_visible  = False
         self._psd_visible    = False
@@ -321,7 +323,7 @@ class ChannelPanel(QWidget):
         # Ki
         ctrl_layout.addWidget(QLabel("Ki"), row, 0)
         self.sp_ki = QDoubleSpinBox()
-        self.sp_ki.setRange(0.0, 1000.0)
+        self.sp_ki.setRange(0.0, 100000.0)
         self.sp_ki.setDecimals(3)
         self.sp_ki.setSingleStep(0.1)
         self.sp_ki.setValue(2.0)
@@ -487,9 +489,7 @@ class ChannelPanel(QWidget):
         self.plot_input.addLegend(offset=(10, 10))
         self.curve_input = self.plot_input.plot(pen=pg.mkPen("#2196F3", width=2), name="Input")
         self.curve_sp    = self.plot_input.plot(pen=pg.mkPen("#4CAF50", width=2, style=Qt.DashLine), name="Setpoint")
-        for c in (self.curve_input, self.curve_sp):
-            c.setDownsampling(auto=True, method="peak")
-            c.setClipToView(True)
+        # (downsampling/clipToView disabled — 400 points is cheap to render)
 
         self.plot_output = pg.PlotWidget(title=f"Ch{self.ch+1} Output Voltage")
         self.plot_output.setLabel("left", "Voltage", units="V")
@@ -497,9 +497,7 @@ class ChannelPanel(QWidget):
         self.plot_output.addLegend(offset=(10, 10))
         self.curve_target_out = self.plot_output.plot(pen=pg.mkPen("#FF5722", width=2, style=Qt.DashLine), name="Target")
         self.curve_actual_out = self.plot_output.plot(pen=pg.mkPen("#E91E63", width=2), name="Actual")
-        for c in (self.curve_target_out, self.curve_actual_out):
-            c.setDownsampling(auto=True, method="peak")
-            c.setClipToView(True)
+        # (downsampling/clipToView disabled — 400 points is cheap to render)
 
         self.plot_stats = pg.PlotWidget(title=f"Ch{self.ch+1} Input distribution (stability)")
         self.plot_stats.setLabel("left", "Count")
@@ -518,10 +516,17 @@ class ChannelPanel(QWidget):
         self.curve_psd = self.plot_psd.plot(pen=pg.mkPen("#7B1FA2", width=2))
         self.plot_psd.hide()
 
+        self.lbl_psd_metrics = QLabel()
+        self.lbl_psd_metrics.setFont(QFont("Consolas, Courier, monospace", 9))
+        self.lbl_psd_metrics.setTextFormat(Qt.PlainText)
+        self.lbl_psd_metrics.setWordWrap(True)
+        self.lbl_psd_metrics.hide()
+
         plot_layout.addWidget(self.plot_input)
         plot_layout.addWidget(self.plot_output)
         plot_layout.addWidget(self.plot_stats)
         plot_layout.addWidget(self.plot_psd)
+        plot_layout.addWidget(self.lbl_psd_metrics)
 
         root.addWidget(ctrl_box)
         root.addWidget(plot_widget, stretch=1)
@@ -624,14 +629,17 @@ class ChannelPanel(QWidget):
         self.btn_autotune.setText("Cancel Autotune")
         self.command.emit(f"SET {self.ch} autotune 1")
 
-    @Slot(float, float, float, float)
-    def on_autotune_done(self, Ku, Tu, Kp, Ki):
+    @Slot(float, float, float, float, float)
+    def on_autotune_done(self, Ku, Tu, Kp, Ki, Kd):
         self._autotuning = False
+        for w in (self.sp_kp, self.sp_ki, self.sp_kd):
+            w.blockSignals(True)
         self.sp_kp.setValue(Kp)
         self.sp_ki.setValue(Ki)
-        self.sp_kd.setValue(0.0)
+        self.sp_kd.setValue(Kd)
+        for w in (self.sp_kp, self.sp_ki, self.sp_kd):
+            w.blockSignals(False)
         self.btn_autotune.setText("Autotune")
-        return Ku, Tu
 
     @Slot()
     def on_autotune_failed(self):
@@ -661,6 +669,7 @@ class ChannelPanel(QWidget):
         self.actual_out_data.clear()
         self.sp_data.clear()
         self.t_data.clear()
+        self._t0 = None
 
     def set_statistics_visible(self, visible: bool):
         self._stats_visible = visible
@@ -671,10 +680,13 @@ class ChannelPanel(QWidget):
     def set_psd_visible(self, visible: bool):
         self._psd_visible = visible
         self.plot_psd.setVisible(visible)
+        self.lbl_psd_metrics.setVisible(visible)
 
     @Slot(float, float, float, float, float, int)
     def add_sample(self, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
-        self.t_data.append(time_s)
+        if self._t0 is None:
+            self._t0 = time_s
+        self.t_data.append(time_s - self._t0)
         self.input_data.append(input_v)
         self.target_out_data.append(target_out_v)
         self.actual_out_data.append(actual_out_v)
@@ -686,9 +698,40 @@ class ChannelPanel(QWidget):
         freqs = np.arange(n_bins) * (fs / ((n_bins - 1) * 2))
         mask = freqs > 0
         self.curve_psd.setData(freqs[mask], bins[mask])
-        self.plot_psd.setTitle(
-            f"Ch{self.ch+1} PSD  (fs={fs:.0f} Hz, {n_bins} bins)"
-        )
+        bw = fs / 2.0
+        if bw >= 1e6:
+            bw_str = f"{bw / 1e6:.1f} MHz"
+        elif bw >= 1e3:
+            bw_str = f"{bw / 1e3:.1f} kHz"
+        else:
+            bw_str = f"{bw:.0f} Hz"
+
+        df = fs / ((n_bins - 1) * 2)
+        sigma2 = float(np.sum(bins[1:]) * df)
+        sigma = np.sqrt(sigma2)
+        v_mean = self.sp_setpoint.value()
+
+        if sigma >= 1e-3:
+            sigma_str = f"{sigma * 1e3:.3f} mV"
+        else:
+            sigma_str = f"{sigma * 1e6:.2f} uV"
+
+        if abs(v_mean) > 1e-9:
+            frac = sigma / abs(v_mean)
+            gate_err = (np.pi ** 2 / 4.0) * sigma2 / (v_mean ** 2)
+            title = (f"Ch{self.ch+1} PSD  (BW {bw_str})  "
+                     f"gate error: {gate_err:.2e}")
+            metrics = (
+                f"RMS noise: {sigma_str}   "
+                f"fractional: {frac:.2e}   "
+                f"pi-pulse 1-F: {gate_err:.2e}"
+            )
+        else:
+            title = f"Ch{self.ch+1} PSD  (BW {bw_str})  setpoint=0, no gate error"
+            metrics = f"RMS noise: {sigma_str}   (set nonzero setpoint for gate error)"
+
+        self.plot_psd.setTitle(title)
+        self.lbl_psd_metrics.setText(metrics)
 
     def _refresh_stats_plot(self):
         data = np.asarray(self.input_data, dtype=float)
@@ -796,7 +839,7 @@ class MainWindow(QMainWindow):
         self.act_psd = QAction("Power spectral &density", self)
         self.act_psd.setCheckable(True)
         self.act_psd.setToolTip(
-            "On-chip FFT power spectral density (V²/Hz) computed on the Red Pitaya."
+            "Fast PSD (V²/Hz) from 125 MS/s ADC bulk-read, computed on the Red Pitaya ARM."
         )
         self.act_psd.toggled.connect(self._on_psd_toggled)
         view_menu.addAction(self.act_psd)
@@ -987,12 +1030,12 @@ class MainWindow(QMainWindow):
         if was:
             self.status.showMessage("Recording stopped")
 
-    @Slot(int, float, float, float, float)
-    def _on_autotune_done(self, ch, Ku, Tu, Kp, Ki):
+    @Slot(int, float, float, float, float, float)
+    def _on_autotune_done(self, ch, Ku, Tu, Kp, Ki, Kd):
         if 0 <= ch < len(self.channel_panels):
-            self.channel_panels[ch].on_autotune_done(Ku, Tu, Kp, Ki)
+            self.channel_panels[ch].on_autotune_done(Ku, Tu, Kp, Ki, Kd)
             self.status.showMessage(
-                f"Ch{ch+1} autotune complete: Ku={Ku:.4f} Tu={Tu:.4f}s  →  Kp={Kp:.4f} Ki={Ki:.4f}")
+                f"Ch{ch+1} autotune complete: Ku={Ku:.4f} Tu={Tu:.4f}s  →  Kp={Kp:.4f} Ki={Ki:.4f} Kd={Kd:.6f}")
 
     @Slot(int)
     def _on_autotune_failed(self, ch):
@@ -1038,6 +1081,10 @@ def main():
 
     window = MainWindow(host, port)
     window.show()
+
+    if len(sys.argv) >= 2:
+        QTimer.singleShot(200, window._on_connect)
+
     sys.exit(app.exec())
 
 

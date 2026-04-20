@@ -70,11 +70,15 @@
 /* --------------- Autotune (relay-feedback, Astrom-Hagglund) --------------- */
 #define AUTOTUNE_RELAY_AMP       0.50f   /* relay output half-amplitude (V)  */
 #define AUTOTUNE_HYSTERESIS      0.005f  /* noise band around setpoint (V)   */
-#define AUTOTUNE_MIN_CYCLES      5       /* full cycles to average           */
-#define AUTOTUNE_SETTLE_CYCLES   2       /* initial cycles to discard        */
-#define AUTOTUNE_TIMEOUT_S       10.0f   /* abort after this many seconds    */
+#define AUTOTUNE_MIN_CYCLES      3       /* full cycles to average           */
+#define AUTOTUNE_SETTLE_CYCLES   1       /* initial cycles to discard        */
+#define AUTOTUNE_TIMEOUT_S       30.0f   /* abort after this many seconds    */
 
-/* --------------- On-chip PSD (power spectral density) ----------------- */
-#define PSD_N                    2048    /* FFT length (must be power of 2)  */
+/* --------------- Fast PSD (power spectral density, bulk-read from FPGA) --- */
+#define PSD_N                    16384   /* FFT length = RP acq buffer depth */
+#define PSD_BINS                 (PSD_N / 2 + 1)   /* one-sided spectrum    */
+#define PSD_DEFAULT_AVG          8       /* Welch segments to average        */
+#define PSD_DEFAULT_INTERVAL_MS  1000    /* ms between PSD updates           */
+#define PSD_FS                   125e6f  /* ADC sample rate with RP_DEC_1    */
 
 #endif /* CONFIG_H */

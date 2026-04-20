@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <time.h>
 #include <math.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -22,12 +23,14 @@ static void sig_handler(int sig) {
     running = 0;
 }
 
-/* -------------------------------------------------------- PID thread */
+/* -------------------------------------------------- thread arguments */
 
 typedef struct {
     int              ch_idx;
     channel_state_t *state;
-} pid_thread_arg_t;
+} thread_arg_t;
+
+/* -------------------------------------------------------- PID thread */
 
 static float triangle_wave(float phase) {
     float t = fmodf(phase, 1.0f);
@@ -36,7 +39,7 @@ static float triangle_wave(float phase) {
 }
 
 static void *pid_thread(void *arg) {
-    pid_thread_arg_t *a  = (pid_thread_arg_t *)arg;
+    thread_arg_t *a  = (thread_arg_t *)arg;
     int               ch = a->ch_idx;
     channel_state_t  *s  = a->state;
     free(a);
@@ -44,9 +47,6 @@ static void *pid_thread(void *arg) {
     static float in_lpf[NUM_CHANNELS];
     static int   in_lpf_init[NUM_CHANNELS];
     float wave_phase = 0.0f;
-
-    psd_state_t psd;
-    psd_init(&psd);
 
     struct timespec next, t0;
     clock_gettime(CLOCK_MONOTONIC, &next);
@@ -123,16 +123,6 @@ static void *pid_thread(void *arg) {
             s->telem_actual_output_v = actual_v;
         }
 
-        /* Feed PSD and copy result to shared state when ready */
-        float fs = (dt > 0.0f) ? (1.0f / dt) : 1000.0f;
-        psd_push_sample(&psd, input_v, fs);
-        if (psd.ready) {
-            memcpy((void *)s->psd_bins, psd.out, sizeof(psd.out));
-            s->psd_fs    = psd.fs;
-            s->psd_ready = 1;
-            psd.ready    = 0;
-        }
-
         /* Advance to the next period */
         long period_ns = (long)s->loop_period_us * 1000L;
         next.tv_nsec += period_ns;
@@ -143,6 +133,56 @@ static void *pid_thread(void *arg) {
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
 
+    return NULL;
+}
+
+/* ------------------------------------------------------- PSD thread */
+
+static void *psd_thread(void *arg) {
+    thread_arg_t *a  = (thread_arg_t *)arg;
+    int               ch = a->ch_idx;
+    channel_state_t  *s  = a->state;
+    free(a);
+
+    psd_state_t psd;
+    if (psd_init(&psd) != 0) {
+        fprintf(stderr, "PSD ch%d: init failed\n", ch);
+        return NULL;
+    }
+
+    float *buf = malloc(PSD_N * sizeof(float));
+    if (!buf) {
+        fprintf(stderr, "PSD ch%d: malloc failed\n", ch);
+        psd_free(&psd);
+        return NULL;
+    }
+
+    while (running) {
+        int interval_ms = s->psd_interval_ms;
+        if (interval_ms < 10) interval_ms = 10;
+        usleep((useconds_t)interval_ms * 1000u);
+
+        int avg_target = s->psd_avg;
+        if (avg_target < 1) avg_target = 1;
+
+        for (int seg = 0; seg < avg_target && running; seg++) {
+            analog_read_bulk(ch, buf, PSD_N);
+            psd_process_buffer(&psd, buf, PSD_FS, avg_target);
+
+            if (seg < avg_target - 1)
+                usleep(200);
+        }
+
+        if (psd.ready) {
+            memcpy((void *)s->psd_bins, psd.out, sizeof(psd.out));
+            s->psd_fs    = psd.fs;
+            s->psd_ready = 1;
+            psd.ready    = 0;
+        }
+    }
+
+    free(buf);
+    psd_free(&psd);
     return NULL;
 }
 
@@ -181,6 +221,9 @@ static void init_channel(channel_state_t *s) {
     s->autotune.state       = AUTOTUNE_IDLE;
     s->autotune_relay_amp   = AUTOTUNE_RELAY_AMP;
     s->autotune_hysteresis  = AUTOTUNE_HYSTERESIS;
+
+    s->psd_avg         = PSD_DEFAULT_AVG;
+    s->psd_interval_ms = PSD_DEFAULT_INTERVAL_MS;
 }
 
 int main(void) {
@@ -207,7 +250,7 @@ int main(void) {
     /* Launch PID threads with real-time priority */
     pthread_t pid_tids[NUM_CHANNELS];
     for (int i = 0; i < NUM_CHANNELS; i++) {
-        pid_thread_arg_t *a = malloc(sizeof(*a));
+        thread_arg_t *a = malloc(sizeof(*a));
         a->ch_idx = i;
         a->state  = &channels[i];
 
@@ -228,6 +271,15 @@ int main(void) {
         }
     }
 
+    /* Launch PSD threads (normal priority, one per channel) */
+    pthread_t psd_tids[NUM_CHANNELS];
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        thread_arg_t *a = malloc(sizeof(*a));
+        a->ch_idx = i;
+        a->state  = &channels[i];
+        pthread_create(&psd_tids[i], NULL, psd_thread, a);
+    }
+
     /* Launch TCP server in its own thread */
     pthread_t tcp_tid;
     pthread_create(&tcp_tid, NULL, tcp_thread, channels);
@@ -235,6 +287,9 @@ int main(void) {
     /* Wait for PID threads (they exit when `running` becomes 0) */
     for (int i = 0; i < NUM_CHANNELS; i++)
         pthread_join(pid_tids[i], NULL);
+
+    for (int i = 0; i < NUM_CHANNELS; i++)
+        pthread_join(psd_tids[i], NULL);
 
     printf("Shutting down...\n");
     analog_io_cleanup();

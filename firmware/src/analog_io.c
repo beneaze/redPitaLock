@@ -51,6 +51,14 @@ float analog_read_raw(int ch) {
     return buf[0];
 }
 
+/* --------------------------------------------------------- bulk read */
+
+uint32_t analog_read_bulk(int ch, float *buf, uint32_t n) {
+    uint32_t size = n;
+    rp_AcqGetLatestDataV(rp_ch[ch], &size, buf);
+    return size;
+}
+
 /* ----------------------------------------------------------- raw write */
 
 static float clampf(float v, float lo, float hi) {

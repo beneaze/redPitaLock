@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -19,13 +20,14 @@ static void send_line(int fd, const char *line) {
 }
 
 static void send_params(int fd, int ch, const channel_state_t *s) {
-    char buf[640];
+    char buf[768];
     snprintf(buf, sizeof(buf),
              "P %d enabled=%d setpoint=%.4f kp=%.4f ki=%.4f kd=%.4f "
              "error_sign=%.1f loop_rate=%d use_lut=%d "
              "in_scale=%.4f in_offset=%.4f out_scale=%.4f out_offset=%.4f "
              "integral_max=%.4f out_min=%.4f out_max=%.4f "
-             "out_mode=%d manual_v=%.4f wave_freq=%.4f wave_amp=%.4f wave_offset=%.4f\n",
+             "out_mode=%d manual_v=%.4f wave_freq=%.4f wave_amp=%.4f wave_offset=%.4f "
+             "psd_avg=%d psd_interval=%d\n",
              ch, s->enabled, s->setpoint_v,
              s->pid.kp, s->pid.ki, s->pid.kd,
              s->error_sign, s->loop_period_us, s->use_lut,
@@ -33,7 +35,8 @@ static void send_params(int fd, int ch, const channel_state_t *s) {
              s->cal.output_scale, s->cal.output_offset,
              s->pid.integral_max, s->pid.out_min, s->pid.out_max,
              s->out_mode, s->manual_v, s->wave_freq_hz,
-             s->wave_amplitude, s->wave_offset);
+             s->wave_amplitude, s->wave_offset,
+             s->psd_avg, s->psd_interval_ms);
     send_line(fd, buf);
 }
 
@@ -79,10 +82,12 @@ static int handle_command(const char *line, int fd, channel_state_t *channels) {
         else if (strcmp(key, "wave_offset") == 0)  s->wave_offset = val;
         else if (strcmp(key, "autotune")  == 0) {
             if ((int)val == 1 && s->enabled && s->autotune.state != AUTOTUNE_RUNNING) {
-                float center = (s->pid.out_min + s->pid.out_max) * 0.5f;
-                float half   = (s->pid.out_max - s->pid.out_min) * 0.5f;
-                float amp    = (s->autotune_relay_amp < half)
-                             ?  s->autotune_relay_amp : half;
+                float center = s->telem_actual_output_v;
+                float headroom = fminf(center - s->pid.out_min,
+                                       s->pid.out_max - center);
+                float amp = (s->autotune_relay_amp < headroom)
+                          ?  s->autotune_relay_amp : headroom;
+                if (amp < 0.01f) amp = 0.01f;
                 autotune_init(&s->autotune, amp, center,
                               s->autotune_hysteresis, s->error_sign,
                               AUTOTUNE_MIN_CYCLES, AUTOTUNE_SETTLE_CYCLES,
@@ -93,6 +98,8 @@ static int handle_command(const char *line, int fd, channel_state_t *channels) {
         }
         else if (strcmp(key, "autotune_amp") == 0)  s->autotune_relay_amp = val;
         else if (strcmp(key, "autotune_hyst") == 0) s->autotune_hysteresis = val;
+        else if (strcmp(key, "psd_avg")      == 0)  s->psd_avg = (int)val;
+        else if (strcmp(key, "psd_interval") == 0)  s->psd_interval_ms = (int)val;
         else return -1;
 
         send_line(fd, "OK\n");
@@ -189,11 +196,12 @@ static void *client_thread(void *arg) {
                     if (send(fd, atbuf, strlen(atbuf), MSG_NOSIGNAL) < 0)
                         goto done;
                 } else if (s->autotune.state == AUTOTUNE_DONE) {
-                    char abuf[128];
+                    char abuf[160];
                     snprintf(abuf, sizeof(abuf),
-                             "A %d %.6f %.6f %.6f %.6f\n",
+                             "A %d %.6f %.6f %.6f %.6f %.6f\n",
                              ch, s->autotune.Ku, s->autotune.Tu,
-                             s->autotune.Kp, s->autotune.Ki);
+                             s->autotune.Kp, s->autotune.Ki,
+                             s->autotune.Kd);
                     if (send(fd, abuf, strlen(abuf), MSG_NOSIGNAL) < 0)
                         goto done;
                     s->autotune.state = AUTOTUNE_IDLE;
@@ -212,8 +220,7 @@ static void *client_thread(void *arg) {
                              ch, PSD_BINS, s->psd_fs);
                     if (send(fd, hdr, strlen(hdr), MSG_NOSIGNAL) < 0)
                         goto done;
-                    /* Send bins as space-separated floats on one line.
-                     * Max line ~12 chars/bin * 1025 bins ≈ 12 KB. */
+                    /* Send bins as space-separated floats on one line. */
                     char *pbuf = malloc(PSD_BINS * 14 + 2);
                     if (pbuf) {
                         int off = 0;

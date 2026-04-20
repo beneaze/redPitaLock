@@ -37,6 +37,7 @@ typedef struct {
     float Tu;
     float Kp;
     float Ki;
+    float Kd;
 } autotune_state_t;
 
 void  autotune_init(autotune_state_t *at, float relay_amp, float relay_center,
@@ -47,7 +48,7 @@ void  autotune_init(autotune_state_t *at, float relay_amp, float relay_center,
 /* Call once per loop iteration while autotune is RUNNING.
  * Returns the relay output voltage to write to the DAC.
  * When enough cycles have been measured, sets state to AUTOTUNE_DONE and
- * populates Ku, Tu, Kp, Ki.  On timeout sets state to AUTOTUNE_FAILED.      */
+ * populates Ku, Tu, Kp, Ki, Kd.  On timeout sets state to AUTOTUNE_FAILED.  */
 float autotune_step(autotune_state_t *at, float setpoint, float measurement,
                     float dt);
 
