@@ -10,7 +10,7 @@ CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -std=gnu11 -Isrc -I/opt/redpitaya/include
 LDFLAGS = -L/opt/redpitaya/lib -Wl,-rpath,/opt/redpitaya/lib -lm -lpthread -lrp
 
-SRC     = src/main.c src/pid.c src/aom_lut.c src/analog_io.c src/autotune.c src/psd.c src/tcp_server.c
+SRC     = src/main.c src/fpga_pi.c src/analog_io.c src/autotune.c src/psd.c src/tcp_server.c
 OBJ     = $(SRC:.c=.o)
 TARGET  = stabilizer_rp
 

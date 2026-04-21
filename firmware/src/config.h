@@ -3,11 +3,42 @@
 
 #define NUM_CHANNELS  2
 
-/* --------------- Default PID gains (per-channel, adjustable at runtime) --- */
-#define DEFAULT_KP               4.0f
-#define DEFAULT_KI               2.0f
-/* Start with D=0; add small Kd only if needed. D uses meas derivative (see pid.c). */
-#define DEFAULT_KD               0.0f
+/* ==========================================================================
+ * Hardware PI -- the actual control loop runs in the FPGA at 125 MHz
+ * (~8 ns latency).  The C daemon is just a parameter pusher: it writes
+ * gains to the FPGA whenever the user changes them, samples telemetry at
+ * ~1 kHz, drives autotune, and handles PSD.
+ *
+ * The FPGA bitstream is the stock RP `red_pitaya_pid_block.v` (which has a
+ * Kd register), but we drive it as PI -- see PI_PSR / PI_ISR below and
+ * fpga_pi.c for why Kd is held at zero.
+ * ========================================================================== */
+
+/* --------------- FPGA PI register block (v0.94 bitstream, CS[3]) ---------- */
+#define FPGA_PI_BASE             0x40300000UL
+#define FPGA_PI_MAP_SIZE         0x1000UL
+
+/* Hardware loop runs every ADC sample. */
+#define HARDWARE_LOOP_HZ         125000000
+
+/* red_pitaya_pid_block.v fixed-point shifts (signed 14-bit registers).
+ * The block has a Kd register too (DSR=10) but its representable range is
+ * only ~64 ns of derivative time, well below anything physically useful for
+ * this plant -- the firmware does not expose Kd at all (PI mode).            */
+#define PI_PSR                   12   /* P shift: kp_eff = set_kp / 2^12     */
+#define PI_ISR                   18   /* I shift: ki_eff = set_ki * fs/2^18  */
+
+/* 14-bit ADC and DAC, +/- 1 V LV range. */
+#define ADC_LSB_PER_VOLT         8192.0f
+#define DAC_LSB_PER_VOLT         8192.0f
+
+/* Effective representable gain ranges (informational; helpful for tuning):
+ *   Kp_user:  +/- (8191 / 4096)        ~ +/- 2.0  V/V
+ *   Ki_user:  smallest step  ~ 477 Hz, max ~ 3.9e6 Hz                       */
+
+/* --------------- Default PI gains (per channel, adjustable at runtime) --- */
+#define DEFAULT_KP               0.5f       /* V / V                         */
+#define DEFAULT_KI               1000.0f    /* 1 / s   (>= ~477 Hz step)     */
 
 /* --------------- Feedback polarity ---------------------------------------- */
 /*  +1: more drive = more signal (diffracted beam)                            */
@@ -17,30 +48,27 @@
 /* --------------- Setpoint (V at fast ADC, LV range ~ +/-1 V) ---------------- */
 #define DEFAULT_SETPOINT_V       0.50f
 
-/* --------------- PID output limits (normalised: 0 = null, 1 = max) -------- */
-#define PID_OUT_MIN              0.0f
-#define PID_OUT_MAX              1.0f
+/* --------------- Supervisor period ---------------------------------------- */
+/* This is NOT the control-loop period (the loop runs at 125 MHz in the
+ * FPGA).  This is how often the C supervisor wakes up to push parameter
+ * changes and collect telemetry.  Compile-time only -- there's no value in
+ * exposing it on the wire.                                                  */
+#define SUPERVISOR_PERIOD_US     1000   /* 1 kHz                             */
 
-/* --------------- Anti-windup: max integral accumulator (V*s) -------------- */
-#define PID_INTEGRAL_MAX         0.5f
-
-/* --------------- Control-loop period (microseconds) ----------------------- */
-/* Adjustable at runtime via TCP; this is just the power-on default.          */
-#define DEFAULT_LOOP_PERIOD_US   1000   /* 1 kHz */
-
-/* --------------- Analog I/O calibration ----------------------------------- */
-/* No scaling -- raw Red Pitaya voltages are used directly.                    */
-#define DEFAULT_INPUT_SCALE      1.0f
-#define DEFAULT_INPUT_OFFSET     0.0f
-#define DEFAULT_OUTPUT_SCALE     1.0f
-#define DEFAULT_OUTPUT_OFFSET    0.0f
-
-/* Clamp the raw Red Pitaya output to the hardware range.                     */
+/* --------------- Analog I/O ------------------------------------------------ */
+/* Hardware DAC envelope.  This is the only output bound the firmware can
+ * honestly enforce -- the v0.94 PID block has no per-channel software
+ * output-min/max register, so the FPGA's instantaneous PI output saturates
+ * at +/- 1 V and nowhere tighter.  If a downstream load (e.g. an AOM
+ * driver) needs a tighter window, add an external clamp circuit (Schottky
+ * pair to a reference voltage, or an op-amp limiter) on the OUT line.      */
 #define RP_OUTPUT_MIN           -1.0f
 #define RP_OUTPUT_MAX            1.0f
 
-/* --------------- Manual output / waveform (when PID is off) --------------- */
-/* Output mode: 0 = DC (manual voltage), 1 = triangle, 2 = sine              */
+/* --------------- Manual output / waveform (when PI is off) ---------------- */
+/* Output mode: 0 = DC (manual voltage), 1 = triangle, 2 = sine.
+ * Triangle / sine are produced by the FPGA signal generator (ASG) so the
+ * waveform is sample-accurate, not stepped at the supervisor rate.          */
 #define OUT_MODE_DC              0
 #define OUT_MODE_TRIANGLE        1
 #define OUT_MODE_SINE            2
@@ -51,21 +79,9 @@
 #define DEFAULT_WAVE_AMPLITUDE   0.5f   /* peak, in volts */
 #define DEFAULT_WAVE_OFFSET      0.0f   /* DC offset, in volts */
 
-/* --------------- AOM LUT -------------------------------------------------- */
-/* Per-channel flag: when true the PID's normalised output (0-1) is passed    */
-/* through aom_linearize() before hitting the DAC.                            */
-#define DEFAULT_USE_LUT          0
-
 /* --------------- TCP server ----------------------------------------------- */
 #define TCP_PORT                 5000
 #define TCP_MAX_CLIENTS          4
-
-/* --------------- Telemetry decimation ------------------------------------- */
-/* Send one telemetry frame every N loop iterations (per channel).            */
-#define DEFAULT_TELEMETRY_DECIM  10
-
-/* First-order LPF on ADC before PID: y += alpha*(raw-y). Higher = faster, noisier. */
-#define INPUT_LPF_ALPHA          0.20f
 
 /* --------------- Autotune (relay-feedback, Astrom-Hagglund) --------------- */
 #define AUTOTUNE_RELAY_AMP       0.50f   /* relay output half-amplitude (V)  */

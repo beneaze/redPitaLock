@@ -19,7 +19,9 @@ int analog_io_init(void) {
     rp_AcqSetTriggerSrc(RP_TRIG_SRC_DISABLED);
     rp_AcqStart();
 
-    /* --- Fast generation: DC mode on both channels --- */
+    /* --- Fast generation: parked in DC mode at 0 V on both channels.
+     * The output stays enabled for the lifetime of the daemon; the
+     * supervisor reconfigures waveform / amplitude / offset on demand.    */
     rp_GenReset();
     for (int i = 0; i < NUM_CHANNELS; i++) {
         rp_GenWaveform(rp_ch[i], RP_WAVEFORM_DC);
@@ -35,6 +37,8 @@ int analog_io_init(void) {
 
 void analog_io_cleanup(void) {
     for (int i = 0; i < NUM_CHANNELS; i++) {
+        rp_GenWaveform(rp_ch[i], RP_WAVEFORM_DC);
+        rp_GenAmp(rp_ch[i], 0.0f);
         rp_GenOffset(rp_ch[i], 0.0f);
         rp_GenOutDisable(rp_ch[i]);
     }
@@ -67,20 +71,35 @@ static float clampf(float v, float lo, float hi) {
     return v;
 }
 
-float analog_write_raw(int ch, float voltage) {
+float analog_set_dc(int ch, float voltage) {
     voltage = clampf(voltage, RP_OUTPUT_MIN, RP_OUTPUT_MAX);
+    rp_GenWaveform(rp_ch[ch], RP_WAVEFORM_DC);
+    rp_GenAmp(rp_ch[ch], 0.0f);
     rp_GenOffset(rp_ch[ch], voltage);
     return voltage;
 }
 
-/* ------------------------------------------------ calibrated wrappers */
+void analog_set_waveform(int ch, int mode, float freq_hz,
+                         float amplitude_v, float offset_v) {
+    if (mode == OUT_MODE_DC) {
+        analog_set_dc(ch, offset_v);
+        return;
+    }
 
-float analog_read(int ch, const analog_cal_t *cal) {
-    (void)cal;
-    return analog_read_raw(ch);
-}
+    if (freq_hz < 0.001f)        freq_hz = 0.001f;
+    if (freq_hz > 60.0e6f)       freq_hz = 60.0e6f;
+    amplitude_v = clampf(amplitude_v, 0.0f, RP_OUTPUT_MAX);
+    offset_v    = clampf(offset_v,    RP_OUTPUT_MIN, RP_OUTPUT_MAX);
+    /* Keep amp + |offset| inside the +/-1 V hardware envelope so the FPGA
+     * doesn't silently clip the waveform tips.                              */
+    float headroom = RP_OUTPUT_MAX - (offset_v >= 0.0f ? offset_v : -offset_v);
+    if (amplitude_v > headroom) amplitude_v = headroom;
 
-float analog_write(int ch, float voltage, const analog_cal_t *cal) {
-    (void)cal;
-    return analog_write_raw(ch, voltage);
+    rp_waveform_t wf = (mode == OUT_MODE_TRIANGLE)
+                       ? RP_WAVEFORM_TRIANGLE
+                       : RP_WAVEFORM_SINE;
+    rp_GenWaveform(rp_ch[ch], wf);
+    rp_GenFreq    (rp_ch[ch], freq_hz);
+    rp_GenAmp     (rp_ch[ch], amplitude_v);
+    rp_GenOffset  (rp_ch[ch], offset_v);
 }

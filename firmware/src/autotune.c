@@ -6,6 +6,77 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
+void autotune_request_bias(autotune_state_t *at,
+                           float relay_amp,
+                           float hysteresis, float error_sign,
+                           int target_cycles, int settle_cycles,
+                           float timeout_s) {
+    /* Stash everything the relay phase will need; the supervisor will call
+     * autotune_init() with the discovered center once the bisection ends.
+     * The bisection always sweeps the full +/- 1 V DAC envelope.            */
+    at->relay_amp     = relay_amp;
+    at->hysteresis    = hysteresis;
+    at->error_sign    = error_sign;
+    at->target_cycles = target_cycles;
+    at->settle_cycles = settle_cycles;
+    at->timeout_s     = timeout_s;
+
+    at->bias_lo         = AUTOTUNE_BIAS_LO;
+    at->bias_hi         = AUTOTUNE_BIAS_HI;
+    at->bias_step       = 0;
+    at->bias_drive      = 0.5f * (AUTOTUNE_BIAS_LO + AUTOTUNE_BIAS_HI);
+    at->bias_wait_ticks = 0;
+
+    at->elapsed         = 0.0f;
+
+    __sync_synchronize();
+    at->state = AUTOTUNE_BIASING;
+
+    printf("[autotune] biasing: bisecting in [%.3f, %.3f] V (esign=%.0f)\n",
+           (double)AUTOTUNE_BIAS_LO, (double)AUTOTUNE_BIAS_HI,
+           (double)error_sign);
+}
+
+float autotune_bias_step(autotune_state_t *at, float setpoint, float input,
+                         int settle_ticks_per_step) {
+    if (at->state != AUTOTUNE_BIASING)
+        return at->bias_drive;
+
+    /* Wait for the plant to settle at the current drive before sampling.   */
+    if (at->bias_wait_ticks > 0) {
+        at->bias_wait_ticks--;
+        return at->bias_drive;
+    }
+
+    /* The plant has settled -- evaluate this step.                         */
+    float err = at->error_sign * (input - setpoint);
+    printf("[autotune] bias step k=%d drive=%.4f input=%.4f err=%+.4f\n",
+           at->bias_step, at->bias_drive, input, err);
+
+    if (fabsf(input - setpoint) < AUTOTUNE_BIAS_TOL_V
+        || at->bias_step >= AUTOTUNE_BIAS_STEPS - 1) {
+        printf("[autotune] bias DONE: center=%.4f after %d step(s)\n",
+               at->bias_drive, at->bias_step + 1);
+        /* Hand off to the relay: autotune_init flips state to RUNNING.     */
+        autotune_init(at, at->relay_amp, at->bias_drive,
+                      at->hysteresis, at->error_sign,
+                      at->target_cycles, at->settle_cycles,
+                      at->timeout_s);
+        return at->bias_drive;
+    }
+
+    /* Tighten the bracket: positive polarity-corrected error means the
+     * drive over-shot, so contract the upper bound; negative means we need
+     * more drive.                                                          */
+    if (err > 0.0f) at->bias_hi = at->bias_drive;
+    else            at->bias_lo = at->bias_drive;
+
+    at->bias_step++;
+    at->bias_drive      = 0.5f * (at->bias_lo + at->bias_hi);
+    at->bias_wait_ticks = settle_ticks_per_step;
+    return at->bias_drive;
+}
+
 void autotune_init(autotune_state_t *at, float relay_amp, float relay_center,
                    float hysteresis, float error_sign,
                    int target_cycles, int settle_cycles,
@@ -30,10 +101,9 @@ void autotune_init(autotune_state_t *at, float relay_amp, float relay_center,
     at->Tu = 0.0f;
     at->Kp = 0.0f;
     at->Ki = 0.0f;
-    at->Kd = 0.0f;
 
-    /* Memory barrier: ensure all fields above are visible before the PID
-     * thread sees state == RUNNING.                                          */
+    /* Memory barrier: ensure all fields above are visible before the
+     * supervisor thread sees state == RUNNING.                               */
     __sync_synchronize();
     at->state = AUTOTUNE_RUNNING;
 
@@ -62,14 +132,15 @@ float autotune_step(autotune_state_t *at, float setpoint, float measurement,
     float error = at->error_sign * (measurement - setpoint);
     at->time_in_cycle += dt;
 
-    /* Track peaks in each half-cycle */
-    if (at->relay_high) {
-        if (measurement > at->peak_hi)
-            at->peak_hi = measurement;
-    } else {
-        if (measurement < at->peak_lo)
-            at->peak_lo = measurement;
-    }
+    /* Track global max / min over the current cycle.  Earlier the update was
+     * gated by relay_high -- but for any plant with phase lag the actual
+     * measurement peak occurs DURING the opposite relay half (overshoot
+     * after the relay flip).  Gating threw those samples away and collapsed
+     * the measured amplitude toward 2*hysteresis, blowing up Ku.            */
+    if (measurement > at->peak_hi)
+        at->peak_hi = measurement;
+    if (measurement < at->peak_lo)
+        at->peak_lo = measurement;
 
     /* Detect zero crossing with hysteresis */
     int crossed = 0;
@@ -113,22 +184,24 @@ float autotune_step(autotune_state_t *at, float setpoint, float measurement,
                 sum_a += at->amplitudes[i];
             }
             at->Tu = sum_T / (float)at->n_measured;
-            float a  = sum_a / (float)at->n_measured;
+            /* Stored amplitudes are peak-to-peak; Astrom-Hagglund's `a` is
+             * the single-sided sinusoidal amplitude, hence the /2.          */
+            float a_half = 0.5f * (sum_a / (float)at->n_measured);
 
-            /* Ku = 4d / (pi * a)  where d = relay_amp */
-            if (a > 1e-9f)
-                at->Ku = (4.0f * at->relay_amp) / ((float)M_PI * a);
+            /* Ku = 4d / (pi * a)  where d = relay half-amplitude            */
+            if (a_half > 1e-9f)
+                at->Ku = (4.0f * at->relay_amp) / ((float)M_PI * a_half);
             else
                 at->Ku = 0.0f;
 
-            /* Tyreus-Luyben PI rules (conservative, good for fast digital loops).
-             * Kd is computed for reference but not auto-applied.              */
+            /* Tyreus-Luyben PI rules (conservative, good for fast digital
+             * loops).  Kd is intentionally not produced -- the FPGA Kd
+             * register can't span anything useful for this plant.          */
             at->Kp = at->Ku / 3.2f;
             at->Ki = (at->Tu > 1e-9f) ? (at->Ku / (7.04f * at->Tu)) : 0.0f;
-            at->Kd = at->Ku * at->Tu / 13.86f;
 
-            printf("[autotune] DONE: Ku=%.4f Tu=%.4fs -> Kp=%.4f Ki=%.4f Kd=%.6f\n",
-                   at->Ku, at->Tu, at->Kp, at->Ki, at->Kd);
+            printf("[autotune] DONE: Ku=%.4f Tu=%.4fs -> Kp=%.4f Ki=%.4f\n",
+                   at->Ku, at->Tu, at->Kp, at->Ki);
             at->state = AUTOTUNE_DONE;
         }
     }

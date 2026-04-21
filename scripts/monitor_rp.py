@@ -1,10 +1,14 @@
 """
-monitor_rp.py -- Qt control GUI for the redPitaLock two-channel PID stabilizer.
+monitor_rp.py -- Qt control GUI for the redPitaLock two-channel PI stabilizer.
 
-Connects to the Red Pitaya daemon over TCP and provides:
-  * Per-channel PID enable/disable (off by default)
-  * Live adjustment of Kp, Ki, Kd, setpoint, loop rate, error sign, AOM LUT
-  * Real-time pyqtgraph plots of analog input and output voltage vs time
+The control loop runs in the Red Pitaya FPGA at 125 MHz; this GUI sets the
+loop's parameters (setpoint, Kp, Ki, error sign) over TCP and plots
+telemetry from the daemon's supervisor thread (~100 Hz).
+
+  * Per-channel PI enable/disable (off by default)
+  * Live adjustment of Kp, Ki, setpoint, error sign
+  * Read-only hardware-loop-rate indicator (reported by the daemon)
+  * Real-time pyqtgraph plots of analog input vs time
   * Optional CSV recording of input (photodiode) voltage vs time for stability checks
   * Optional histogram of input with Gaussian overlay and mean / std (View menu)
 
@@ -30,14 +34,12 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPushButton,
-    QSpinBox,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -58,12 +60,13 @@ class TcpWorker(QThread):
     """Background thread that maintains the TCP connection, parses telemetry,
     and forwards commands from the GUI."""
 
-    data_received = Signal(int, float, float, float, float, float, int)  # ch, time_s, in_v, target_out, actual_out, sp, enabled
+    data_received = Signal(int, float, float, float, float, int)         # ch, time_s, in_v, out_v (NaN while PI on), sp, enabled
     params_received = Signal(int, dict)                                  # ch, {key: value_str, ...}
     psd_received = Signal(int, int, float, object)                       # ch, n_bins, fs, np.array of PSD bins
-    autotune_done = Signal(int, float, float, float, float, float)        # ch, Ku, Tu, Kp, Ki, Kd
+    autotune_done = Signal(int, float, float, float, float)               # ch, Ku, Tu, Kp, Ki
     autotune_failed = Signal(int)                                        # ch
     autotune_progress = Signal(int, int, int, float)                     # ch, crossings, cycles, elapsed_s
+    error_received = Signal(str)                                         # human-readable ERR reply from the daemon
     connected = Signal()
     disconnected = Signal(str)
 
@@ -135,7 +138,10 @@ class TcpWorker(QThread):
                     p_ch, p_nbins, p_fs = pending_psd_hdr
                     pending_psd_hdr = None
                     try:
-                        bins = np.fromstring(line, dtype=float, sep=" ")
+                        # np.fromstring is deprecated since NumPy 1.14; use
+                        # the explicit parser, which is also faster than
+                        # ascii regex for ~8k floats.
+                        bins = np.array(line.split(), dtype=float)
                         if bins.size == p_nbins:
                             self.psd_received.emit(p_ch, p_nbins, p_fs, bins)
                     except Exception:
@@ -144,16 +150,15 @@ class TcpWorker(QThread):
 
                 if line.startswith("D "):
                     parts = line.split()
-                    if len(parts) >= 7:
+                    if len(parts) >= 6:
                         try:
                             ch  = int(parts[1])
                             ts  = float(parts[2])
                             iv  = float(parts[3])
-                            tgt = float(parts[4])
-                            act = float(parts[5])
-                            sp  = float(parts[6])
-                            en  = int(parts[7]) if len(parts) > 7 else 0
-                            latest[ch] = (ts, iv, tgt, act, sp, en)
+                            ov  = float(parts[4])  # NaN while PI is engaged
+                            sp  = float(parts[5])
+                            en  = int(parts[6]) if len(parts) > 6 else 0
+                            latest[ch] = (ts, iv, ov, sp, en)
                         except (ValueError, IndexError):
                             pass
                 elif line.startswith("PSD "):
@@ -198,22 +203,23 @@ class TcpWorker(QThread):
                             pass
                 elif line.startswith("A "):
                     parts = line.split()
-                    if len(parts) >= 7:
+                    if len(parts) >= 6:
                         try:
                             ch = int(parts[1])
                             Ku = float(parts[2])
                             Tu = float(parts[3])
                             Kp = float(parts[4])
                             Ki = float(parts[5])
-                            Kd = float(parts[6])
-                            self.autotune_done.emit(ch, Ku, Tu, Kp, Ki, Kd)
+                            self.autotune_done.emit(ch, Ku, Tu, Kp, Ki)
                         except (ValueError, IndexError):
                             pass
+                elif line.startswith("ERR"):
+                    self.error_received.emit(line.strip())
 
             if latest:
                 for ch in sorted(latest.keys()):
-                    ts, iv, tgt, act, sp, en = latest[ch]
-                    self.data_received.emit(ch, ts, iv, tgt, act, sp, en)
+                    ts, iv, ov, sp, en = latest[ch]
+                    self.data_received.emit(ch, ts, iv, ov, sp, en)
 
         if self._sock:
             self._sock.close()
@@ -222,22 +228,26 @@ class TcpWorker(QThread):
 # ----------------------------------------------------------- Channel widget
 
 class ChannelPanel(QWidget):
-    """Controls + plots for a single PID channel."""
+    """Controls + plots for a single PI channel."""
 
     command = Signal(str)  # emitted when the user changes a parameter
+    status_message = Signal(str)  # emitted to surface info on the main status bar
 
     def __init__(self, ch_index: int, parent=None):
         super().__init__(parent)
         self.ch = ch_index
         self.input_data      = deque(maxlen=HISTORY)
-        self.target_out_data = deque(maxlen=HISTORY)
-        self.actual_out_data = deque(maxlen=HISTORY)
+        self.output_data     = deque(maxlen=HISTORY)  # NaN where PI is engaged
         self.sp_data         = deque(maxlen=HISTORY)
         self.t_data          = deque(maxlen=HISTORY)  # server-side timestamp (s)
         self._t0             = None
         self._autotuning     = False
         self._stats_visible  = False
         self._psd_visible    = False
+        # Stats plot is expensive (histogram + Gaussian fit); only refresh
+        # every Nth plot tick instead of every frame.
+        self._stats_refresh_ticks = 0
+        self._stats_refresh_every = 10  # ~3 Hz at 30 Hz plot timer
 
         self._build_ui()
 
@@ -252,8 +262,8 @@ class ChannelPanel(QWidget):
         ctrl_box.setLayout(ctrl_layout)
         row = 0
 
-        # PID enable
-        self.btn_enable = QPushButton("PID OFF")
+        # PI enable
+        self.btn_enable = QPushButton("PI OFF")
         self.btn_enable.setCheckable(True)
         self.btn_enable.setChecked(False)
         self.btn_enable.setStyleSheet(
@@ -280,83 +290,45 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(self.sp_setpoint, row, 1)
         row += 1
 
-        # PID output limits (controller command before DAC clamp +/-1 V)
-        ctrl_layout.addWidget(QLabel("PID out min (V)"), row, 0)
-        self.sp_out_min = QDoubleSpinBox()
-        self.sp_out_min.setRange(-1.0, 1.0)
-        self.sp_out_min.setDecimals(3)
-        self.sp_out_min.setSingleStep(0.05)
-        self.sp_out_min.setValue(0.0)
-        self.sp_out_min.setToolTip("Minimum command the PID is allowed to request (volts to DAC path).")
-        self.sp_out_min.editingFinished.connect(
-            lambda: self.command.emit(f"SET {self.ch} out_min {self.sp_out_min.value():.4f}"))
-        ctrl_layout.addWidget(self.sp_out_min, row, 1)
-        row += 1
-
-        ctrl_layout.addWidget(QLabel("PID out max (V)"), row, 0)
-        self.sp_out_max = QDoubleSpinBox()
-        self.sp_out_max.setRange(-1.0, 1.0)
-        self.sp_out_max.setDecimals(3)
-        self.sp_out_max.setSingleStep(0.05)
-        self.sp_out_max.setValue(1.0)
-        self.sp_out_max.setToolTip(
-            "Maximum command the PID may request. Default 1.0 V matches STEMlab fast out. "
-            "If the loop never reaches setpoint, raise this (and gains) or check error sign."
-        )
-        self.sp_out_max.editingFinished.connect(
-            lambda: self.command.emit(f"SET {self.ch} out_max {self.sp_out_max.value():.4f}"))
-        ctrl_layout.addWidget(self.sp_out_max, row, 1)
-        row += 1
-
-        # Kp
+        # Kp (FPGA fixed-point: PSR=12, 14-bit signed -> |Kp| <= ~2 V/V)
         ctrl_layout.addWidget(QLabel("Kp"), row, 0)
         self.sp_kp = QDoubleSpinBox()
-        self.sp_kp.setRange(0.0, 1000.0)
-        self.sp_kp.setDecimals(3)
-        self.sp_kp.setSingleStep(0.1)
-        self.sp_kp.setValue(4.0)
+        self.sp_kp.setRange(0.0, 2.0)
+        self.sp_kp.setDecimals(4)
+        self.sp_kp.setSingleStep(0.01)
+        self.sp_kp.setValue(0.5)
+        self.sp_kp.setToolTip(
+            "Proportional gain (V/V). FPGA fixed-point limit is ~|Kp| <= 2.0; "
+            "values are clamped on the device."
+        )
         self.sp_kp.editingFinished.connect(
             lambda: self.command.emit(f"SET {self.ch} kp {self.sp_kp.value():.4f}"))
         ctrl_layout.addWidget(self.sp_kp, row, 1)
         row += 1
 
-        # Ki
-        ctrl_layout.addWidget(QLabel("Ki"), row, 0)
+        # Ki (FPGA fixed-point: ISR=18, T_clk=8 ns -> step ~477 Hz, max ~3.9 MHz)
+        ctrl_layout.addWidget(QLabel("Ki (Hz)"), row, 0)
         self.sp_ki = QDoubleSpinBox()
-        self.sp_ki.setRange(0.0, 100000.0)
-        self.sp_ki.setDecimals(3)
-        self.sp_ki.setSingleStep(0.1)
-        self.sp_ki.setValue(2.0)
+        self.sp_ki.setRange(0.0, 3.9e6)
+        self.sp_ki.setDecimals(1)
+        self.sp_ki.setSingleStep(100.0)
+        self.sp_ki.setValue(1000.0)
+        self.sp_ki.setToolTip(
+            "Integral gain in 1/s (Hz). FPGA quantum is ~477 Hz; max ~3.9 MHz. "
+            "The integrator runs in the FPGA at 125 MHz."
+        )
         self.sp_ki.editingFinished.connect(
-            lambda: self.command.emit(f"SET {self.ch} ki {self.sp_ki.value():.4f}"))
+            lambda: self.command.emit(f"SET {self.ch} ki {self.sp_ki.value():.2f}"))
         ctrl_layout.addWidget(self.sp_ki, row, 1)
         row += 1
 
-        # Kd
-        ctrl_layout.addWidget(QLabel("Kd"), row, 0)
-        self.sp_kd = QDoubleSpinBox()
-        self.sp_kd.setRange(0.0, 100.0)
-        self.sp_kd.setDecimals(4)
-        self.sp_kd.setSingleStep(0.001)
-        self.sp_kd.setValue(0.0)
-        self.sp_kd.setToolTip(
-            "Derivative gain. Uses rate of change of the *photodiode voltage*, not raw error, "
-            "so ADC noise is not amplified. Start at 0; add a little only if you need damping."
+        # Hardware loop rate (read-only; populated from GET params -> hw_loop_hz)
+        ctrl_layout.addWidget(QLabel("Hardware loop"), row, 0)
+        self.lbl_hw_loop = QLabel("-- (waiting for daemon)")
+        self.lbl_hw_loop.setToolTip(
+            "PI loop rate in the FPGA. Reported by the daemon at connect time."
         )
-        self.sp_kd.editingFinished.connect(
-            lambda: self.command.emit(f"SET {self.ch} kd {self.sp_kd.value():.5f}"))
-        ctrl_layout.addWidget(self.sp_kd, row, 1)
-        row += 1
-
-        # Loop rate
-        ctrl_layout.addWidget(QLabel("Loop period (us)"), row, 0)
-        self.sp_loop = QSpinBox()
-        self.sp_loop.setRange(10, 1000000)
-        self.sp_loop.setSingleStep(100)
-        self.sp_loop.setValue(1000)
-        self.sp_loop.editingFinished.connect(
-            lambda: self.command.emit(f"SET {self.ch} loop_rate {self.sp_loop.value()}"))
-        ctrl_layout.addWidget(self.sp_loop, row, 1)
+        ctrl_layout.addWidget(self.lbl_hw_loop, row, 1)
         row += 1
 
         # Error sign
@@ -367,16 +339,8 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(self.cb_sign, row, 1)
         row += 1
 
-        # AOM LUT
-        self.chk_lut = QCheckBox("AOM linearization (LUT)")
-        self.chk_lut.setChecked(False)
-        self.chk_lut.toggled.connect(
-            lambda v: self.command.emit(f"SET {self.ch} use_lut {int(v)}"))
-        ctrl_layout.addWidget(self.chk_lut, row, 0, 1, 2)
-        row += 1
-
-        # Reset PID
-        btn_reset = QPushButton("Reset PID integrator")
+        # Reset PI integrator
+        btn_reset = QPushButton("Reset PI integrator")
         btn_reset.clicked.connect(
             lambda: self.command.emit(f"SET {self.ch} reset 0"))
         ctrl_layout.addWidget(btn_reset, row, 0, 1, 2)
@@ -391,7 +355,8 @@ class ChannelPanel(QWidget):
         self.sp_at_amp.setValue(0.50)
         self.sp_at_amp.setToolTip(
             "Half-amplitude of the relay output during autotune. "
-            "With out_min=0 and out_max=1, amp=0.5 uses the full range [0,1]."
+            "Clamped on the device to fit inside the autotune bracket "
+            "around the discovered operating point."
         )
         self.sp_at_amp.editingFinished.connect(
             lambda: self.command.emit(f"SET {self.ch} autotune_amp {self.sp_at_amp.value():.4f}"))
@@ -407,8 +372,8 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(self.btn_autotune, row, 0, 1, 2)
         row += 1
 
-        # --- Manual output / waveform (active when PID is off) ---
-        self.manual_group = QGroupBox("Manual Output (PID off)")
+        # --- Manual output / waveform (active when PI is off) ---
+        self.manual_group = QGroupBox("Manual Output (PI off)")
         manual_layout = QGridLayout()
         self.manual_group.setLayout(manual_layout)
         mrow = 0
@@ -426,7 +391,7 @@ class ChannelPanel(QWidget):
         self.sp_manual_v.setDecimals(4)
         self.sp_manual_v.setSingleStep(0.01)
         self.sp_manual_v.setValue(0.0)
-        self.sp_manual_v.setToolTip("Output voltage when mode is DC and PID is off.")
+        self.sp_manual_v.setToolTip("Output voltage when mode is DC and PI is off.")
         self.sp_manual_v.editingFinished.connect(
             lambda: self.command.emit(f"SET {self.ch} manual_v {self.sp_manual_v.value():.4f}"))
         manual_layout.addWidget(self.sp_manual_v, mrow, 1)
@@ -487,17 +452,35 @@ class ChannelPanel(QWidget):
         self.plot_input.setLabel("left", "Voltage", units="V")
         self.plot_input.setLabel("bottom", "Time", units="s")
         self.plot_input.addLegend(offset=(10, 10))
+        # Y autoscale, but bounded by the +/-1 V hardware range so a stray
+        # huge sample / all-NaN burst can't fling the view out of physics.
+        self.plot_input.setLimits(yMin=-1.05, yMax=1.05)
+        self.plot_input.enableAutoRange(axis='y', enable=True)
+        self.plot_input.getViewBox().setAutoVisible(y=True)
         self.curve_input = self.plot_input.plot(pen=pg.mkPen("#2196F3", width=2), name="Input")
         self.curve_sp    = self.plot_input.plot(pen=pg.mkPen("#4CAF50", width=2, style=Qt.DashLine), name="Setpoint")
         # (downsampling/clipToView disabled — 400 points is cheap to render)
 
-        self.plot_output = pg.PlotWidget(title=f"Ch{self.ch+1} Output Voltage")
+        self.plot_output = pg.PlotWidget(
+            title=f"Ch{self.ch+1} Output  (PI off: DAC drive | PI on: PI target)"
+        )
         self.plot_output.setLabel("left", "Voltage", units="V")
         self.plot_output.setLabel("bottom", "Time", units="s")
         self.plot_output.addLegend(offset=(10, 10))
-        self.curve_target_out = self.plot_output.plot(pen=pg.mkPen("#FF5722", width=2, style=Qt.DashLine), name="Target")
-        self.curve_actual_out = self.plot_output.plot(pen=pg.mkPen("#E91E63", width=2), name="Actual")
-        # (downsampling/clipToView disabled — 400 points is cheap to render)
+        # Same: autoscale Y but bounded to the +/-1 V hardware envelope.
+        # When PI is on the supervisor reports NaN for output_v; pyqtgraph
+        # ignores NaN when autoranging, so the view will simply stay at the
+        # last finite range until something finite arrives again.
+        self.plot_output.setLimits(yMin=-1.05, yMax=1.05)
+        self.plot_output.enableAutoRange(axis='y', enable=True)
+        self.plot_output.getViewBox().setAutoVisible(y=True)
+        # connect="finite" tells pyqtgraph to break the line on NaN samples,
+        # which we get whenever the FPGA owns the DAC.
+        self.curve_output = self.plot_output.plot(
+            pen=pg.mkPen("#E91E63", width=2),
+            name="Output / PI target",
+            connect="finite",
+        )
 
         self.plot_stats = pg.PlotWidget(title=f"Ch{self.ch+1} Input distribution (stability)")
         self.plot_stats.setLabel("left", "Count")
@@ -540,9 +523,9 @@ class ChannelPanel(QWidget):
         def _i(v): return int(float(v))
 
         for widget in (
-            self.btn_enable, self.sp_setpoint, self.sp_out_min, self.sp_out_max,
-            self.sp_kp, self.sp_ki, self.sp_kd, self.sp_loop, self.cb_sign,
-            self.chk_lut, self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
+            self.btn_enable, self.sp_setpoint,
+            self.sp_kp, self.sp_ki, self.cb_sign,
+            self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
             self.sp_wave_amp, self.sp_wave_offset, self.sp_at_amp,
         ):
             widget.blockSignals(True)
@@ -550,25 +533,26 @@ class ChannelPanel(QWidget):
         if "enabled" in kv:
             en = _i(kv["enabled"])
             self.btn_enable.setChecked(bool(en))
-            self.btn_enable.setText("PID ON" if en else "PID OFF")
+            self.btn_enable.setText("PI ON" if en else "PI OFF")
         if "setpoint" in kv:
             self.sp_setpoint.setValue(_f(kv["setpoint"]))
-        if "out_min" in kv:
-            self.sp_out_min.setValue(_f(kv["out_min"]))
-        if "out_max" in kv:
-            self.sp_out_max.setValue(_f(kv["out_max"]))
         if "kp" in kv:
             self.sp_kp.setValue(_f(kv["kp"]))
         if "ki" in kv:
             self.sp_ki.setValue(_f(kv["ki"]))
-        if "kd" in kv:
-            self.sp_kd.setValue(_f(kv["kd"]))
-        if "loop_rate" in kv:
-            self.sp_loop.setValue(_i(kv["loop_rate"]))
         if "error_sign" in kv:
             self.cb_sign.setCurrentIndex(0 if _f(kv["error_sign"]) >= 0 else 1)
-        if "use_lut" in kv:
-            self.chk_lut.setChecked(bool(_i(kv["use_lut"])))
+        if "hw_loop_hz" in kv:
+            try:
+                hz = _f(kv["hw_loop_hz"])
+                if hz >= 1e6:
+                    period_ns = 1e9 / hz
+                    self.lbl_hw_loop.setText(
+                        f"{hz/1e6:.1f} MHz  ({period_ns:.1f} ns / sample)")
+                else:
+                    self.lbl_hw_loop.setText(f"{hz:.1f} Hz")
+            except (TypeError, ValueError):
+                pass
         if "out_mode" in kv:
             self.cb_out_mode.setCurrentIndex(_i(kv["out_mode"]))
         if "manual_v" in kv:
@@ -579,13 +563,13 @@ class ChannelPanel(QWidget):
             self.sp_wave_amp.setValue(_f(kv["wave_amp"]))
         if "wave_offset" in kv:
             self.sp_wave_offset.setValue(_f(kv["wave_offset"]))
-        if "integral_max" in kv:
-            pass
+        if "autotune_amp" in kv:
+            self.sp_at_amp.setValue(_f(kv["autotune_amp"]))
 
         for widget in (
-            self.btn_enable, self.sp_setpoint, self.sp_out_min, self.sp_out_max,
-            self.sp_kp, self.sp_ki, self.sp_kd, self.sp_loop, self.cb_sign,
-            self.chk_lut, self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
+            self.btn_enable, self.sp_setpoint,
+            self.sp_kp, self.sp_ki, self.cb_sign,
+            self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
             self.sp_wave_amp, self.sp_wave_offset, self.sp_at_amp,
         ):
             widget.blockSignals(False)
@@ -595,7 +579,7 @@ class ChannelPanel(QWidget):
     # ...................................................... callbacks
 
     def _on_enable_toggled(self, checked):
-        self.btn_enable.setText("PID ON" if checked else "PID OFF")
+        self.btn_enable.setText("PI ON" if checked else "PI OFF")
         self.command.emit(f"SET {self.ch} enabled {int(checked)}")
         self._update_manual_fields_visibility()
 
@@ -604,14 +588,14 @@ class ChannelPanel(QWidget):
         self._update_manual_fields_visibility()
 
     def _update_manual_fields_visibility(self):
-        pid_on = self.btn_enable.isChecked()
-        self.manual_group.setEnabled(not pid_on)
+        pi_on = self.btn_enable.isChecked()
+        self.manual_group.setEnabled(not pi_on)
         mode = self.cb_out_mode.currentIndex()
         is_wave = mode in (1, 2)
-        self.sp_manual_v.setEnabled(not pid_on and not is_wave)
-        self.sp_wave_freq.setEnabled(not pid_on and is_wave)
-        self.sp_wave_amp.setEnabled(not pid_on and is_wave)
-        self.sp_wave_offset.setEnabled(not pid_on and is_wave)
+        self.sp_manual_v.setEnabled(not pi_on and not is_wave)
+        self.sp_wave_freq.setEnabled(not pi_on and is_wave)
+        self.sp_wave_amp.setEnabled(not pi_on and is_wave)
+        self.sp_wave_offset.setEnabled(not pi_on and is_wave)
 
     def _on_sign_changed(self, idx):
         sign = 1.0 if idx == 0 else -1.0
@@ -624,20 +608,27 @@ class ChannelPanel(QWidget):
             self.command.emit(f"SET {self.ch} autotune 0")
             return
         if not self.btn_enable.isChecked():
+            # Surface the reason -- silent no-op was the #1 "autotune doesn't
+            # work" complaint.
+            msg = f"Ch{self.ch+1}: enable PI before starting Autotune"
+            self.status_message.emit(msg)
+            self.btn_autotune.setText("Enable PI first")
+            QTimer.singleShot(2000,
+                lambda: self.btn_autotune.setText("Autotune")
+                        if not self._autotuning else None)
             return
         self._autotuning = True
         self.btn_autotune.setText("Cancel Autotune")
         self.command.emit(f"SET {self.ch} autotune 1")
 
-    @Slot(float, float, float, float, float)
-    def on_autotune_done(self, Ku, Tu, Kp, Ki, Kd):
+    @Slot(float, float, float, float)
+    def on_autotune_done(self, Ku, Tu, Kp, Ki):
         self._autotuning = False
-        for w in (self.sp_kp, self.sp_ki, self.sp_kd):
+        for w in (self.sp_kp, self.sp_ki):
             w.blockSignals(True)
         self.sp_kp.setValue(Kp)
         self.sp_ki.setValue(Ki)
-        self.sp_kd.setValue(Kd)
-        for w in (self.sp_kp, self.sp_ki, self.sp_kd):
+        for w in (self.sp_kp, self.sp_ki):
             w.blockSignals(False)
         self.btn_autotune.setText("Autotune")
 
@@ -656,17 +647,15 @@ class ChannelPanel(QWidget):
 
     def set_history_size(self, n: int):
         """Resize all rolling buffers to hold *n* samples."""
-        self.input_data      = deque(self.input_data, maxlen=n)
-        self.target_out_data = deque(self.target_out_data, maxlen=n)
-        self.actual_out_data = deque(self.actual_out_data, maxlen=n)
-        self.sp_data         = deque(self.sp_data, maxlen=n)
-        self.t_data          = deque(self.t_data, maxlen=n)
+        self.input_data  = deque(self.input_data,  maxlen=n)
+        self.output_data = deque(self.output_data, maxlen=n)
+        self.sp_data     = deque(self.sp_data,     maxlen=n)
+        self.t_data      = deque(self.t_data,      maxlen=n)
 
     def reset_timebase(self):
         """Clear history and restart the time axis (e.g. on new TCP connection)."""
         self.input_data.clear()
-        self.target_out_data.clear()
-        self.actual_out_data.clear()
+        self.output_data.clear()
         self.sp_data.clear()
         self.t_data.clear()
         self._t0 = None
@@ -682,14 +671,15 @@ class ChannelPanel(QWidget):
         self.plot_psd.setVisible(visible)
         self.lbl_psd_metrics.setVisible(visible)
 
-    @Slot(float, float, float, float, float, int)
-    def add_sample(self, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+    @Slot(float, float, float, float, int)
+    def add_sample(self, time_s, input_v, output_v, setpoint_v, enabled):
         if self._t0 is None:
             self._t0 = time_s
         self.t_data.append(time_s - self._t0)
         self.input_data.append(input_v)
-        self.target_out_data.append(target_out_v)
-        self.actual_out_data.append(actual_out_v)
+        # output_v is NaN while the FPGA is driving the loop -- pyqtgraph
+        # plots NaN as a gap thanks to connect="finite".
+        self.output_data.append(output_v)
         self.sp_data.append(setpoint_v)
 
     def set_psd_data(self, n_bins: int, fs: float, bins):
@@ -769,10 +759,12 @@ class ChannelPanel(QWidget):
         x = np.array(self.t_data, dtype=float)
         self.curve_input.setData(x, np.array(self.input_data))
         self.curve_sp.setData(x, np.array(self.sp_data))
-        self.curve_target_out.setData(x, np.array(self.target_out_data))
-        self.curve_actual_out.setData(x, np.array(self.actual_out_data))
+        self.curve_output.setData(x, np.array(self.output_data, dtype=float))
         if self._stats_visible:
-            self._refresh_stats_plot()
+            self._stats_refresh_ticks += 1
+            if self._stats_refresh_ticks >= self._stats_refresh_every:
+                self._stats_refresh_ticks = 0
+                self._refresh_stats_plot()
 
 
 # ----------------------------------------------------------- Main window
@@ -780,7 +772,7 @@ class ChannelPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, host: str, port: int):
         super().__init__()
-        self.setWindowTitle("redPitaLock -- PID Stabilizer Control")
+        self.setWindowTitle("redPitaLock -- PI Stabilizer Control")
         self.resize(1200, 880)
 
         # Central widget
@@ -904,11 +896,13 @@ class MainWindow(QMainWindow):
         self.worker.autotune_done.connect(self._on_autotune_done)
         self.worker.autotune_failed.connect(self._on_autotune_failed)
         self.worker.autotune_progress.connect(self._on_autotune_progress)
+        self.worker.error_received.connect(self._on_error)
         self.worker.connected.connect(self._on_connected)
         self.worker.disconnected.connect(self._on_disconnected)
 
         for panel in self.channel_panels:
             panel.command.connect(self._send_command)
+            panel.status_message.connect(self._on_panel_status)
 
         self.status.showMessage(f"Connecting to {host}:{port}...")
         self.worker.start()
@@ -934,13 +928,23 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.send_command(cmd)
 
+    @Slot(str)
+    def _on_panel_status(self, msg):
+        self.status.showMessage(msg, 5000)
+
+    @Slot(str)
+    def _on_error(self, line):
+        # Surface daemon-side errors (e.g. "ERR autotune requires PI enabled")
+        # so they don't disappear into the void.
+        self.status.showMessage(line, 5000)
+
     @Slot(int, dict)
     def _on_params(self, ch, kv):
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].sync_from_params(kv)
 
-    @Slot(int, float, float, float, float, float, int)
-    def _on_data(self, ch, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+    @Slot(int, float, float, float, float, int)
+    def _on_data(self, ch, time_s, input_v, output_v, setpoint_v, enabled):
         self._last_input[ch] = input_v
         if self._record_writer is not None and self._record_t0 is not None:
             t = time.perf_counter() - self._record_t0
@@ -958,7 +962,7 @@ class MainWindow(QMainWindow):
             self._record_file.flush()
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].add_sample(
-                time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled
+                time_s, input_v, output_v, setpoint_v, enabled
             )
 
     @Slot(int, int, float, object)
@@ -1030,12 +1034,12 @@ class MainWindow(QMainWindow):
         if was:
             self.status.showMessage("Recording stopped")
 
-    @Slot(int, float, float, float, float, float)
-    def _on_autotune_done(self, ch, Ku, Tu, Kp, Ki, Kd):
+    @Slot(int, float, float, float, float)
+    def _on_autotune_done(self, ch, Ku, Tu, Kp, Ki):
         if 0 <= ch < len(self.channel_panels):
-            self.channel_panels[ch].on_autotune_done(Ku, Tu, Kp, Ki, Kd)
+            self.channel_panels[ch].on_autotune_done(Ku, Tu, Kp, Ki)
             self.status.showMessage(
-                f"Ch{ch+1} autotune complete: Ku={Ku:.4f} Tu={Tu:.4f}s  →  Kp={Kp:.4f} Ki={Ki:.4f} Kd={Kd:.6f}")
+                f"Ch{ch+1} autotune complete: Ku={Ku:.4f} Tu={Tu:.4f}s  ->  Kp={Kp:.4f} Ki={Ki:.4f}")
 
     @Slot(int)
     def _on_autotune_failed(self, ch):
