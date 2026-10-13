@@ -162,12 +162,12 @@ static void *client_thread(void *arg) {
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-    FILE *fp = fdopen(fd, "r");
-    if (!fp) { close(fd); return NULL; }
-
-    /* Telemetry counter: we send telemetry every ~10 ms in the background
-     * while also checking for incoming commands (non-blocking readline). */
-    char line_buf[256];
+    /* Incoming commands are accumulated in `rx` and split on newlines, so
+     * several commands arriving in one TCP segment are all handled in the
+     * same cycle. (A stdio fgets() here would buffer the extra lines and
+     * select() would not see them until the client sent more data.)      */
+    char rx[1024];
+    size_t rx_len = 0;
     int telem_counter = 0;
 
     while (1) {
@@ -179,18 +179,32 @@ static void *client_thread(void *arg) {
 
         int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (sel > 0) {
-            if (fgets(line_buf, sizeof(line_buf), fp) == NULL)
-                break; /* client disconnected */
+            ssize_t n = recv(fd, rx + rx_len, sizeof(rx) - 1 - rx_len, 0);
+            if (n <= 0)
+                break; /* client disconnected or error */
+            rx_len += (size_t)n;
+            rx[rx_len] = '\0';
 
-            /* Strip trailing newline */
-            size_t len = strlen(line_buf);
-            while (len > 0 && (line_buf[len-1] == '\n' || line_buf[len-1] == '\r'))
-                line_buf[--len] = '\0';
-
-            if (len > 0) {
-                if (handle_command(line_buf, fd, channels) < 0)
-                    send_line(fd, "ERR unknown command\n");
+            /* Handle every complete line in the buffer. */
+            char *start = rx;
+            char *nl;
+            while ((nl = memchr(start, '\n', rx_len - (size_t)(start - rx))) != NULL) {
+                *nl = '\0';
+                size_t len = (size_t)(nl - start);
+                while (len > 0 && (start[len-1] == '\r' || start[len-1] == ' '))
+                    start[--len] = '\0';
+                if (len > 0) {
+                    if (handle_command(start, fd, channels) < 0)
+                        send_line(fd, "ERR unknown command\n");
+                }
+                start = nl + 1;
             }
+            /* Keep any partial trailing line; drop it if it cannot fit. */
+            size_t rest = rx_len - (size_t)(start - rx);
+            if (rest >= sizeof(rx) - 1)
+                rest = 0;
+            memmove(rx, start, rest);
+            rx_len = rest;
         } else if (sel < 0) {
             break; /* error */
         }
@@ -271,7 +285,7 @@ static void *client_thread(void *arg) {
     }
 
 done:
-    fclose(fp); /* also closes fd */
+    close(fd);
     return NULL;
 }
 

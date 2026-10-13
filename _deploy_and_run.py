@@ -4,7 +4,7 @@ import os
 import sys
 import time
 
-RP_HOST = "10.0.0.15"
+RP_HOST = "rp-f0f492.local"
 RP_USER = "root"
 RP_PASS = "root"
 REMOTE_DIR = "/root/redPitaLock/firmware"
@@ -57,7 +57,7 @@ def main():
     print("Upload complete.\n")
 
     print("Stopping old instance...")
-    ssh_exec(ssh, "killall stabilizer_rp 2>/dev/null; sleep 1; echo done")
+    ssh_exec(ssh, "pkill -TERM -x stabilizer_rp; for i in $(seq 1 20); do pgrep -x stabilizer_rp >/dev/null || break; sleep 0.25; done; pgrep -x stabilizer_rp >/dev/null && pkill -KILL -x stabilizer_rp; sleep 0.5; pgrep -x stabilizer_rp >/dev/null && echo STILL RUNNING || echo stopped")
 
     print("\nCompiling...")
     rc, _, _ = ssh_exec(ssh, f"cd {REMOTE_DIR} && make clean && make")
