@@ -22,4 +22,11 @@ void  pid_reset(pid_state_t *pid);
 float pid_update(pid_state_t *pid, float setpoint, float measurement, float dt,
                  float error_sign);
 
+/* Bumpless transfer: re-seed the integrator so that the next pid_update()
+ * call (with the same setpoint/measurement) returns `target_output`.
+ * Also restarts the derivative so no D kick occurs on the first sample.
+ * If ki is ~0 the integrator is left untouched.                               */
+void  pid_seed_output(pid_state_t *pid, float setpoint, float measurement,
+                      float error_sign, float target_output);
+
 #endif /* PID_H */

@@ -68,6 +68,7 @@ flowchart LR
 - Optional AOM linearization lookup table per channel
 - Configurable PID output limits (out_min / out_max)
 - Anti-windup integral clamping
+- **Sample and hold**: freeze the loop (integrator, input filter and DAC output) while the beam is gated off, triggered by an external TTL on a DIO pin, by an input threshold, or manually; bumpless resume with a settle delay
 - **Fast power spectral density** (PSD) from 125 MS/s ADC bulk-read with Welch averaging, showing RMS noise, fractional stability, and gate error metrics
 - Real-time plots of input voltage, target output, actual output, input distribution, and PSD (pyqtgraph, ~100 Hz)
 - Simple text-based TCP protocol (debuggable with `telnet`)
@@ -89,6 +90,7 @@ redPitaLock/
 │       └── tcp_server.c / .h # Telemetry streaming + command parser
 ├── scripts/
 │   ├── monitor_rp.py         # PySide6 Qt control GUI
+│   ├── test_hold.py          # TCP test of the sample-and-hold logic (no GUI)
 │   └── requirements.txt      # Python dependencies
 ├── .gitignore
 └── README.md
@@ -119,7 +121,19 @@ commands.
 | SMA OUT1 | AOM drive channel 1 (through conditioning circuit) |
 | SMA IN2 | Photodiode channel 2 (through voltage divider) |
 | SMA OUT2 | AOM drive channel 2 (through conditioning circuit) |
+| E1 pin 3 (DIO0_P) | Sample-and-hold gate TTL, channel 1 (3.3 V logic) |
+| E1 pin 5 (DIO1_P) | Sample-and-hold gate TTL, channel 2 (3.3 V logic) |
+| E1 pin 25 / 26 | GND for the gate signals |
 | Ethernet | Network connection to PC |
+
+### Sample-and-hold gate wiring
+
+The E1 digital inputs are **3.3 V LVCMOS and not 5 V tolerant** (absolute
+maximum about 3.85 V). For a 5 V TTL control line, tee the signal at the RF
+switch's control input and add a divider at the header: 1 kΩ in series,
+1.8 kΩ from the pin to GND (5 V -> 3.2 V). A 3.3 V logic signal can be
+connected directly. The pin index is selectable per channel (`hold_pin`,
+n selects DIO<n>_P), as is the polarity (`hold_pol`).
 
 ## Building the Firmware
 
@@ -197,6 +211,28 @@ python monitor_rp.py rp-XXXX.local 5000  # explicit host + port
 | **Reset PID integrator** | Zero the integral accumulator |
 | **Autotune amp (V)** | Relay half-amplitude for autotune excitation |
 | **Autotune** | Start/cancel relay-feedback autotune; shows live progress |
+| **HOLD now** | Manual sample-and-hold: freeze the PID output immediately (any mode) |
+| **Gate source** | Off / External TTL (DIO) / Input threshold |
+| **DIO pin (E1), Hold while pin** | Which DIO<n>_P pin gates the hold, and at which level |
+| **Threshold, Hysteresis (V)** | Threshold mode: hold while raw input < threshold, release above threshold + hysteresis |
+| **Debounce (samples)** | Consecutive gated loop iterations before the hold engages |
+| **Resume delay (us)** | Keep holding this long after the gate releases, so the plant can settle |
+| **Park output while holding** | Drive a fixed park voltage during the hold instead of the last PID output |
+
+### Sample and hold
+
+When the gate asserts while the PID is on, the loop enters **HOLD**: the
+integrator and the input low-pass filter are frozen and the DAC keeps the last
+PID output (or the park voltage). A running autotune is aborted. When the gate
+releases, the loop waits `resume_delay` and then resumes **bumplessly**: the
+filter restarts on fresh data and the integrator is re-seeded so the first new
+PID output equals the held output. The gate state is evaluated and reported
+even while the PID is off, so wiring and polarity can be checked on the status
+lamp before closing the loop. Hold intervals are shaded on the input plot.
+
+With the TTL switch upstream of the mixer, the Red Pitaya output has no effect
+on the beam during a gap, so "hold last output" (the default) is the right
+choice; "park" is for setups that need the RF drive off.
 
 ## TCP Protocol
 
@@ -206,16 +242,19 @@ to debug.
 ### Telemetry (server -> client, ~100 Hz)
 
 ```
-D <ch> <input_V> <target_out_V> <actual_out_V> <setpoint_V> <enabled>
+D <ch> <time_s> <input_V> <target_out_V> <actual_out_V> <setpoint_V> <enabled> <holding> <gate>
 AT <ch> <crossings> <measured_cycles> <elapsed_s>    # while autotune is running
 A <ch> <Ku> <Tu> <Kp> <Ki> <Kd>                       # autotune completed
 AF <ch>                                               # autotune failed (timeout)
 ```
 
+`holding` is 1 while the PID output is frozen by the sample-and-hold logic;
+`gate` is the raw gate state (reported even when the PID is off).
+
 Example:
 ```
-D 0 0.4832 0.7521 0.7521 0.5000 1
-D 1 0.3210 0.0000 0.0000 0.5000 0
+D 0 12.345678 0.4832 0.7521 0.7521 0.5000 1 0 0
+D 1 12.345680 0.3210 0.0000 0.0000 0.5000 0 0 1
 AT 0 4 1 2.3
 A 0 12.3456 0.0234 5.5555 284.3210 0.000744
 ```
@@ -243,7 +282,18 @@ SET <ch> autotune 1             # start relay-feedback autotune
 SET <ch> autotune 0             # cancel autotune
 SET <ch> autotune_amp 0.5       # relay half-amplitude (V)
 SET <ch> autotune_hyst 0.005    # hysteresis band (V)
-GET <ch> params                 # query all parameters
+SET <ch> hold 1                 # manual sample-and-hold on (0 = release)
+SET <ch> hold_mode 1            # gate source: 0 off, 1 external TTL (DIO), 2 input threshold
+SET <ch> hold_pin 0             # DIO<n>_P pin index 0..7 (DIO mode)
+SET <ch> hold_pol 0             # 0: hold while pin LOW, 1: hold while HIGH
+SET <ch> hold_thresh 0.05       # threshold mode: hold while raw input < this (V)
+SET <ch> hold_hyst 0.01         # release when raw input > thresh + hyst (V)
+SET <ch> hold_debounce 2        # consecutive gated samples before holding
+SET <ch> resume_delay 200       # keep holding this long after release (us)
+SET <ch> hold_park 0            # 1: drive hold_park_v while holding
+SET <ch> hold_park_v 0.0        # park voltage (V)
+SET <ch> hold_count_reset 0     # zero the hold event counter
+GET <ch> params                 # query all parameters (includes hold_* and hold_count)
 ```
 
 ## PID Algorithm

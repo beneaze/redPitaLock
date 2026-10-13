@@ -20,14 +20,17 @@ static void send_line(int fd, const char *line) {
 }
 
 static void send_params(int fd, int ch, const channel_state_t *s) {
-    char buf[768];
+    char buf[1024];
     snprintf(buf, sizeof(buf),
              "P %d enabled=%d setpoint=%.4f kp=%.4f ki=%.4f kd=%.4f "
              "error_sign=%.1f loop_rate=%d use_lut=%d "
              "in_scale=%.4f in_offset=%.4f out_scale=%.4f out_offset=%.4f "
              "integral_max=%.4f out_min=%.4f out_max=%.4f "
              "out_mode=%d manual_v=%.4f wave_freq=%.4f wave_amp=%.4f wave_offset=%.4f "
-             "psd_avg=%d psd_interval=%d\n",
+             "psd_avg=%d psd_interval=%d "
+             "hold_mode=%d hold=%d hold_pin=%d hold_pol=%d hold_thresh=%.4f "
+             "hold_hyst=%.4f hold_debounce=%d resume_delay=%d hold_park=%d "
+             "hold_park_v=%.4f hold_count=%d\n",
              ch, s->enabled, s->setpoint_v,
              s->pid.kp, s->pid.ki, s->pid.kd,
              s->error_sign, s->loop_period_us, s->use_lut,
@@ -36,8 +39,18 @@ static void send_params(int fd, int ch, const channel_state_t *s) {
              s->pid.integral_max, s->pid.out_min, s->pid.out_max,
              s->out_mode, s->manual_v, s->wave_freq_hz,
              s->wave_amplitude, s->wave_offset,
-             s->psd_avg, s->psd_interval_ms);
+             s->psd_avg, s->psd_interval_ms,
+             s->hold_mode, s->hold_manual, s->hold_pin, s->hold_polarity,
+             s->hold_thresh_v, s->hold_hyst_v, s->hold_debounce,
+             s->resume_delay_us, s->hold_park, s->hold_park_v,
+             s->telem_hold_count);
     send_line(fd, buf);
+}
+
+static int clampi(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
 /* Parse one command line. Returns 0 on success, -1 on parse error. */
@@ -100,6 +113,18 @@ static int handle_command(const char *line, int fd, channel_state_t *channels) {
         else if (strcmp(key, "autotune_hyst") == 0) s->autotune_hysteresis = val;
         else if (strcmp(key, "psd_avg")      == 0)  s->psd_avg = (int)val;
         else if (strcmp(key, "psd_interval") == 0)  s->psd_interval_ms = (int)val;
+        /* --- Sample and hold --- */
+        else if (strcmp(key, "hold")         == 0)  s->hold_manual = ((int)val != 0);
+        else if (strcmp(key, "hold_mode")    == 0)  s->hold_mode = clampi((int)val, HOLD_MODE_OFF, HOLD_MODE_THRESHOLD);
+        else if (strcmp(key, "hold_pin")     == 0)  s->hold_pin = clampi((int)val, 0, DIGITAL_IN_COUNT - 1);
+        else if (strcmp(key, "hold_pol")     == 0)  s->hold_polarity = ((int)val != 0);
+        else if (strcmp(key, "hold_thresh")  == 0)  s->hold_thresh_v = val;
+        else if (strcmp(key, "hold_hyst")    == 0)  s->hold_hyst_v = (val < 0.0f) ? 0.0f : val;
+        else if (strcmp(key, "hold_debounce") == 0) s->hold_debounce = clampi((int)val, 1, 100000);
+        else if (strcmp(key, "resume_delay") == 0)  s->resume_delay_us = clampi((int)val, 0, 10000000);
+        else if (strcmp(key, "hold_park")    == 0)  s->hold_park = ((int)val != 0);
+        else if (strcmp(key, "hold_park_v")  == 0)  s->hold_park_v = val;
+        else if (strcmp(key, "hold_count_reset") == 0) s->telem_hold_count = 0;
         else return -1;
 
         send_line(fd, "OK\n");
@@ -177,12 +202,15 @@ static void *client_thread(void *arg) {
             for (int ch = 0; ch < NUM_CHANNELS; ch++) {
                 channel_state_t *s = &channels[ch];
                 char tbuf[160];
+                /* Fields: ch time input target actual setpoint enabled
+                 *         holding gate   (last two added for sample-and-hold) */
                 snprintf(tbuf, sizeof(tbuf),
-                         "D %d %.6f %.5f %.5f %.5f %.4f %d\n",
+                         "D %d %.6f %.5f %.5f %.5f %.4f %d %d %d\n",
                          ch, s->telem_time_s,
                          s->telem_input_v, s->telem_output_v,
                          s->telem_actual_output_v,
-                         s->setpoint_v, s->enabled);
+                         s->setpoint_v, s->enabled,
+                         s->telem_holding, s->telem_gate);
                 if (send(fd, tbuf, strlen(tbuf), MSG_NOSIGNAL) < 0)
                     goto done;
 

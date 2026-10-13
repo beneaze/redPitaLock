@@ -66,3 +66,20 @@ float pid_update(pid_state_t *pid, float setpoint, float measurement, float dt,
     float output = p_term + pid->ki * pid->integral + d_term;
     return clampf(output, pid->out_min, pid->out_max);
 }
+
+void pid_seed_output(pid_state_t *pid, float setpoint, float measurement,
+                     float error_sign, float target_output) {
+    /* Restart the derivative: the first pid_update() after this call skips
+     * the D term and just records prev_measurement.                          */
+    pid->deriv_init = 0;
+    pid->prev_measurement = measurement;
+
+    if (pid->ki > 1e-9f || pid->ki < -1e-9f) {
+        float error  = error_sign * (setpoint - measurement);
+        float p_term = pid->kp * error;
+        float target = clampf(target_output, pid->out_min, pid->out_max);
+        float integral = (target - p_term) / pid->ki;
+        pid->integral = clampf(integral, -pid->integral_max, pid->integral_max);
+        pid->prev_error = error;
+    }
+}

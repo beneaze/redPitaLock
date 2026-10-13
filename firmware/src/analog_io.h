@@ -48,4 +48,15 @@ uint32_t analog_read_bulk(int ch, float *buf, uint32_t n);
 float analog_read(int ch, const analog_cal_t *cal);
 float analog_write(int ch, float physical_v, const analog_cal_t *cal);
 
+/* Digital inputs on the E1 header (3.3 V LVCMOS, NOT 5 V tolerant).
+ * `pin_idx` n selects DIO<n>_P, n = 0..7 (DIO0_P is E1 pin 3, DIO1_P pin 5,
+ * ... odd pins; GND on pins 25/26). Used as the sample-and-hold gate.        */
+#define DIGITAL_IN_COUNT 8
+
+/* Configure all DIO<n>_P pins as inputs. Returns 0 on success.              */
+int  digital_in_init(void);
+
+/* Read DIO<pin_idx>_P. Returns 1 (high), 0 (low) or -1 on error/bad index.  */
+int  digital_in_read(int pin_idx);
+
 #endif /* ANALOG_IO_H */

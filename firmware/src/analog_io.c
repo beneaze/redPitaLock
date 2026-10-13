@@ -84,3 +84,29 @@ float analog_write(int ch, float voltage, const analog_cal_t *cal) {
     (void)cal;
     return analog_write_raw(ch, voltage);
 }
+
+/* ------------------------------------------------------- digital inputs */
+
+static rp_dpin_t dio_p_pin(int pin_idx) {
+    return (rp_dpin_t)((int)RP_DIO0_P + pin_idx);
+}
+
+int digital_in_init(void) {
+    int rc = 0;
+    for (int i = 0; i < DIGITAL_IN_COUNT; i++) {
+        if (rp_DpinSetDirection(dio_p_pin(i), RP_IN) != RP_OK) {
+            fprintf(stderr, "rp_DpinSetDirection(DIO%d_P) failed\n", i);
+            rc = -1;
+        }
+    }
+    return rc;
+}
+
+int digital_in_read(int pin_idx) {
+    if (pin_idx < 0 || pin_idx >= DIGITAL_IN_COUNT)
+        return -1;
+    rp_pinState_t st;
+    if (rp_DpinGetState(dio_p_pin(pin_idx), &st) != RP_OK)
+        return -1;
+    return (st == RP_HIGH) ? 1 : 0;
+}

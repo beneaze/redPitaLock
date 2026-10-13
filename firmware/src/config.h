@@ -74,6 +74,27 @@
 #define AUTOTUNE_SETTLE_CYCLES   1       /* initial cycles to discard        */
 #define AUTOTUNE_TIMEOUT_S       30.0f   /* abort after this many seconds    */
 
+/* --------------- Sample and hold ------------------------------------------ */
+/* While the gate is asserted the PID is frozen: integrator, input filter and  */
+/* DAC output keep their last values. On release the loop resumes bumplessly.  */
+/* Gate source (per channel, runtime selectable):                              */
+/*   0 = off, 1 = external TTL on a DIO<n>_P pin of E1, 2 = input threshold.   */
+/* A manual hold (SET <ch> hold 1) is OR-ed in regardless of the mode.         */
+#define HOLD_MODE_OFF            0
+#define HOLD_MODE_DIO            1
+#define HOLD_MODE_THRESHOLD      2
+
+#define DEFAULT_HOLD_MODE        HOLD_MODE_OFF
+/* DIO pin index n -> DIO<n>_P. Channel i defaults to DIO<i>_P (E1 pin 3 + 2i). */
+#define DEFAULT_HOLD_PIN(ch)     (ch)
+#define DEFAULT_HOLD_POLARITY    0       /* 0: hold while pin LOW, 1: while HIGH */
+#define DEFAULT_HOLD_THRESH_V    0.05f   /* threshold mode: hold while raw < this */
+#define DEFAULT_HOLD_HYST_V      0.01f   /* ... release when raw > thresh + hyst  */
+#define DEFAULT_HOLD_DEBOUNCE    2       /* consecutive gated samples to enter    */
+#define DEFAULT_RESUME_DELAY_US  200     /* keep holding this long after release  */
+#define DEFAULT_HOLD_PARK        0       /* 0: hold last output, 1: park output   */
+#define DEFAULT_HOLD_PARK_V      0.0f    /* park voltage when hold_park = 1       */
+
 /* --------------- Fast PSD (power spectral density, bulk-read from FPGA) --- */
 #define PSD_N                    16384   /* FFT length = RP acq buffer depth */
 #define PSD_BINS                 (PSD_N / 2 + 1)   /* one-sided spectrum    */

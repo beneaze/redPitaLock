@@ -7,6 +7,8 @@ Connects to the Red Pitaya daemon over TCP and provides:
   * Real-time pyqtgraph plots of analog input and output voltage vs time
   * Optional CSV recording of input (photodiode) voltage vs time for stability checks
   * Optional histogram of input with Gaussian overlay and mean / std (View menu)
+  * Sample-and-hold: freeze the PID on an external TTL, an input threshold or
+    manually; hold intervals are shaded on the input plot
 
 Usage:
     python monitor_rp.py                       # default host rp-XXXX.local
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStatusBar,
     QTabWidget,
@@ -58,7 +61,8 @@ class TcpWorker(QThread):
     """Background thread that maintains the TCP connection, parses telemetry,
     and forwards commands from the GUI."""
 
-    data_received = Signal(int, float, float, float, float, float, int)  # ch, time_s, in_v, target_out, actual_out, sp, enabled
+    # ch, time_s, in_v, target_out, actual_out, sp, enabled, holding, gate
+    data_received = Signal(int, float, float, float, float, float, int, int, int)
     params_received = Signal(int, dict)                                  # ch, {key: value_str, ...}
     psd_received = Signal(int, int, float, object)                       # ch, n_bins, fs, np.array of PSD bins
     autotune_done = Signal(int, float, float, float, float, float)        # ch, Ku, Tu, Kp, Ki, Kd
@@ -153,7 +157,11 @@ class TcpWorker(QThread):
                             act = float(parts[5])
                             sp  = float(parts[6])
                             en  = int(parts[7]) if len(parts) > 7 else 0
-                            latest[ch] = (ts, iv, tgt, act, sp, en)
+                            # Sample-and-hold fields (firmware >= this branch);
+                            # older firmware omits them.
+                            hold = int(parts[8]) if len(parts) > 8 else 0
+                            gate = int(parts[9]) if len(parts) > 9 else 0
+                            latest[ch] = (ts, iv, tgt, act, sp, en, hold, gate)
                         except (ValueError, IndexError):
                             pass
                 elif line.startswith("PSD "):
@@ -212,8 +220,8 @@ class TcpWorker(QThread):
 
             if latest:
                 for ch in sorted(latest.keys()):
-                    ts, iv, tgt, act, sp, en = latest[ch]
-                    self.data_received.emit(ch, ts, iv, tgt, act, sp, en)
+                    ts, iv, tgt, act, sp, en, hold, gate = latest[ch]
+                    self.data_received.emit(ch, ts, iv, tgt, act, sp, en, hold, gate)
 
         if self._sock:
             self._sock.close()
@@ -234,10 +242,13 @@ class ChannelPanel(QWidget):
         self.actual_out_data = deque(maxlen=HISTORY)
         self.sp_data         = deque(maxlen=HISTORY)
         self.t_data          = deque(maxlen=HISTORY)  # server-side timestamp (s)
+        self.hold_data       = deque(maxlen=HISTORY)  # 1 while output held
         self._t0             = None
         self._autotuning     = False
         self._stats_visible  = False
         self._psd_visible    = False
+        self._hold_regions: list[pg.LinearRegionItem] = []
+        self._hold_status    = None   # (holding, gate) last shown
 
         self._build_ui()
 
@@ -407,6 +418,133 @@ class ChannelPanel(QWidget):
         ctrl_layout.addWidget(self.btn_autotune, row, 0, 1, 2)
         row += 1
 
+        # --- Sample and hold ---
+        self.hold_group = QGroupBox("Sample && Hold")
+        hold_layout = QGridLayout()
+        self.hold_group.setLayout(hold_layout)
+        hrow = 0
+
+        self.lbl_hold_status = QLabel("gate idle")
+        self.lbl_hold_status.setAlignment(Qt.AlignCenter)
+        self.lbl_hold_status.setStyleSheet(
+            "QLabel { background-color: #e0e0e0; color: #333; padding: 4px; font-weight: bold; }")
+        self.lbl_hold_status.setToolTip(
+            "Gate: the hold source is asserted (also shown while PID is off, "
+            "so you can check TTL wiring/polarity).\n"
+            "HOLDING: PID is on and its output is frozen.")
+        hold_layout.addWidget(self.lbl_hold_status, hrow, 0, 1, 2)
+        hrow += 1
+
+        self.btn_hold = QPushButton("HOLD now")
+        self.btn_hold.setCheckable(True)
+        self.btn_hold.setStyleSheet(
+            "QPushButton { padding: 6px; font-weight: bold; }"
+            "QPushButton:checked { background-color: #FFB300; color: black; }")
+        self.btn_hold.setToolTip("Manual hold: freezes the PID output immediately, in any mode.")
+        self.btn_hold.toggled.connect(self._on_hold_toggled)
+        hold_layout.addWidget(self.btn_hold, hrow, 0, 1, 2)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Gate source"), hrow, 0)
+        self.cb_hold_mode = QComboBox()
+        self.cb_hold_mode.addItems(["Off", "External TTL (DIO)", "Input threshold"])
+        self.cb_hold_mode.setToolTip(
+            "Off: only the manual HOLD button.\n"
+            "External TTL: freeze while DIO<n>_P on E1 is at the hold level "
+            "(3.3 V logic, NOT 5 V tolerant).\n"
+            "Input threshold: freeze while the raw photodiode voltage is below the threshold.")
+        self.cb_hold_mode.currentIndexChanged.connect(self._on_hold_mode_changed)
+        hold_layout.addWidget(self.cb_hold_mode, hrow, 1)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("DIO pin (E1)"), hrow, 0)
+        self.sp_hold_pin = QSpinBox()
+        self.sp_hold_pin.setRange(0, 7)
+        self.sp_hold_pin.setValue(self.ch)
+        self.sp_hold_pin.setToolTip("n selects DIO<n>_P. DIO0_P = E1 pin 3, DIO1_P = pin 5, ... GND = pins 25/26.")
+        self.sp_hold_pin.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} hold_pin {self.sp_hold_pin.value()}"))
+        hold_layout.addWidget(self.sp_hold_pin, hrow, 1)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Hold while pin"), hrow, 0)
+        self.cb_hold_pol = QComboBox()
+        self.cb_hold_pol.addItems(["LOW", "HIGH"])
+        self.cb_hold_pol.currentIndexChanged.connect(
+            lambda idx: self.command.emit(f"SET {self.ch} hold_pol {idx}"))
+        hold_layout.addWidget(self.cb_hold_pol, hrow, 1)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Threshold (V)"), hrow, 0)
+        self.sp_hold_thresh = QDoubleSpinBox()
+        self.sp_hold_thresh.setRange(-1.0, 1.0)
+        self.sp_hold_thresh.setDecimals(4)
+        self.sp_hold_thresh.setSingleStep(0.01)
+        self.sp_hold_thresh.setValue(0.05)
+        self.sp_hold_thresh.setToolTip("Threshold mode: hold while the raw input is below this voltage.")
+        self.sp_hold_thresh.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} hold_thresh {self.sp_hold_thresh.value():.4f}"))
+        hold_layout.addWidget(self.sp_hold_thresh, hrow, 1)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Hysteresis (V)"), hrow, 0)
+        self.sp_hold_hyst = QDoubleSpinBox()
+        self.sp_hold_hyst.setRange(0.0, 1.0)
+        self.sp_hold_hyst.setDecimals(4)
+        self.sp_hold_hyst.setSingleStep(0.005)
+        self.sp_hold_hyst.setValue(0.01)
+        self.sp_hold_hyst.setToolTip("Threshold mode: release only once the input exceeds threshold + hysteresis.")
+        self.sp_hold_hyst.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} hold_hyst {self.sp_hold_hyst.value():.4f}"))
+        hold_layout.addWidget(self.sp_hold_hyst, hrow, 1)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Debounce (samples)"), hrow, 0)
+        self.sp_hold_debounce = QSpinBox()
+        self.sp_hold_debounce.setRange(1, 100000)
+        self.sp_hold_debounce.setValue(2)
+        self.sp_hold_debounce.setToolTip("Consecutive loop iterations the gate must be asserted before holding.")
+        self.sp_hold_debounce.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} hold_debounce {self.sp_hold_debounce.value()}"))
+        hold_layout.addWidget(self.sp_hold_debounce, hrow, 1)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Resume delay (us)"), hrow, 0)
+        self.sp_resume_delay = QSpinBox()
+        self.sp_resume_delay.setRange(0, 10000000)
+        self.sp_resume_delay.setSingleStep(100)
+        self.sp_resume_delay.setValue(200)
+        self.sp_resume_delay.setToolTip(
+            "Keep holding this long after the gate releases, so AOM/RF/photodiode can settle "
+            "before the loop re-engages (rounded up to whole loop periods).")
+        self.sp_resume_delay.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} resume_delay {self.sp_resume_delay.value()}"))
+        hold_layout.addWidget(self.sp_resume_delay, hrow, 1)
+        hrow += 1
+
+        self.chk_hold_park = QCheckBox("Park output while holding")
+        self.chk_hold_park.setToolTip(
+            "Unchecked: keep the last PID output on the DAC during the hold (default, right when "
+            "an upstream TTL switch blanks the beam).\nChecked: drive the park voltage instead.")
+        self.chk_hold_park.toggled.connect(self._on_hold_park_toggled)
+        hold_layout.addWidget(self.chk_hold_park, hrow, 0, 1, 2)
+        hrow += 1
+
+        hold_layout.addWidget(QLabel("Park voltage (V)"), hrow, 0)
+        self.sp_hold_park_v = QDoubleSpinBox()
+        self.sp_hold_park_v.setRange(-1.0, 1.0)
+        self.sp_hold_park_v.setDecimals(4)
+        self.sp_hold_park_v.setSingleStep(0.01)
+        self.sp_hold_park_v.setValue(0.0)
+        self.sp_hold_park_v.editingFinished.connect(
+            lambda: self.command.emit(f"SET {self.ch} hold_park_v {self.sp_hold_park_v.value():.4f}"))
+        hold_layout.addWidget(self.sp_hold_park_v, hrow, 1)
+        hrow += 1
+
+        ctrl_layout.addWidget(self.hold_group, row, 0, 1, 2)
+        row += 1
+        self._update_hold_fields_visibility()
+
         # --- Manual output / waveform (active when PID is off) ---
         self.manual_group = QGroupBox("Manual Output (PID off)")
         manual_layout = QGridLayout()
@@ -476,6 +614,14 @@ class ChannelPanel(QWidget):
         ctrl_layout.setRowStretch(row, 1)
         ctrl_box.setFixedWidth(280)
 
+        # The control column is taller than most screens now: scroll it.
+        ctrl_scroll = QScrollArea()
+        ctrl_scroll.setWidget(ctrl_box)
+        ctrl_scroll.setWidgetResizable(True)
+        ctrl_scroll.setFrameShape(QScrollArea.NoFrame)
+        ctrl_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ctrl_scroll.setFixedWidth(300)
+
         # ---------- Right: plots ----------
         plot_widget = QWidget()
         plot_layout = QVBoxLayout(plot_widget)
@@ -528,7 +674,7 @@ class ChannelPanel(QWidget):
         plot_layout.addWidget(self.plot_psd)
         plot_layout.addWidget(self.lbl_psd_metrics)
 
-        root.addWidget(ctrl_box)
+        root.addWidget(ctrl_scroll)
         root.addWidget(plot_widget, stretch=1)
 
     # ...................................................... param sync
@@ -539,12 +685,16 @@ class ChannelPanel(QWidget):
         def _f(v): return float(v)
         def _i(v): return int(float(v))
 
-        for widget in (
+        synced = (
             self.btn_enable, self.sp_setpoint, self.sp_out_min, self.sp_out_max,
             self.sp_kp, self.sp_ki, self.sp_kd, self.sp_loop, self.cb_sign,
             self.chk_lut, self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
             self.sp_wave_amp, self.sp_wave_offset, self.sp_at_amp,
-        ):
+            self.btn_hold, self.cb_hold_mode, self.sp_hold_pin, self.cb_hold_pol,
+            self.sp_hold_thresh, self.sp_hold_hyst, self.sp_hold_debounce,
+            self.sp_resume_delay, self.chk_hold_park, self.sp_hold_park_v,
+        )
+        for widget in synced:
             widget.blockSignals(True)
 
         if "enabled" in kv:
@@ -581,16 +731,34 @@ class ChannelPanel(QWidget):
             self.sp_wave_offset.setValue(_f(kv["wave_offset"]))
         if "integral_max" in kv:
             pass
+        # Sample and hold
+        if "hold" in kv:
+            self.btn_hold.setChecked(bool(_i(kv["hold"])))
+            self._refresh_hold_button_text()
+        if "hold_mode" in kv:
+            self.cb_hold_mode.setCurrentIndex(max(0, min(2, _i(kv["hold_mode"]))))
+        if "hold_pin" in kv:
+            self.sp_hold_pin.setValue(_i(kv["hold_pin"]))
+        if "hold_pol" in kv:
+            self.cb_hold_pol.setCurrentIndex(1 if _i(kv["hold_pol"]) else 0)
+        if "hold_thresh" in kv:
+            self.sp_hold_thresh.setValue(_f(kv["hold_thresh"]))
+        if "hold_hyst" in kv:
+            self.sp_hold_hyst.setValue(_f(kv["hold_hyst"]))
+        if "hold_debounce" in kv:
+            self.sp_hold_debounce.setValue(_i(kv["hold_debounce"]))
+        if "resume_delay" in kv:
+            self.sp_resume_delay.setValue(_i(kv["resume_delay"]))
+        if "hold_park" in kv:
+            self.chk_hold_park.setChecked(bool(_i(kv["hold_park"])))
+        if "hold_park_v" in kv:
+            self.sp_hold_park_v.setValue(_f(kv["hold_park_v"]))
 
-        for widget in (
-            self.btn_enable, self.sp_setpoint, self.sp_out_min, self.sp_out_max,
-            self.sp_kp, self.sp_ki, self.sp_kd, self.sp_loop, self.cb_sign,
-            self.chk_lut, self.cb_out_mode, self.sp_manual_v, self.sp_wave_freq,
-            self.sp_wave_amp, self.sp_wave_offset, self.sp_at_amp,
-        ):
+        for widget in synced:
             widget.blockSignals(False)
 
         self._update_manual_fields_visibility()
+        self._update_hold_fields_visibility()
 
     # ...................................................... callbacks
 
@@ -616,6 +784,77 @@ class ChannelPanel(QWidget):
     def _on_sign_changed(self, idx):
         sign = 1.0 if idx == 0 else -1.0
         self.command.emit(f"SET {self.ch} error_sign {sign:.1f}")
+
+    # ...................................................... sample & hold
+
+    def _refresh_hold_button_text(self):
+        self.btn_hold.setText("Release HOLD" if self.btn_hold.isChecked() else "HOLD now")
+
+    def _on_hold_toggled(self, checked):
+        self._refresh_hold_button_text()
+        self.command.emit(f"SET {self.ch} hold {int(checked)}")
+
+    def _on_hold_mode_changed(self, idx):
+        self.command.emit(f"SET {self.ch} hold_mode {idx}")
+        self._update_hold_fields_visibility()
+
+    def _on_hold_park_toggled(self, checked):
+        self.command.emit(f"SET {self.ch} hold_park {int(checked)}")
+        self._update_hold_fields_visibility()
+
+    def _update_hold_fields_visibility(self):
+        mode = self.cb_hold_mode.currentIndex()
+        dio = mode == 1
+        thresh = mode == 2
+        self.sp_hold_pin.setEnabled(dio)
+        self.cb_hold_pol.setEnabled(dio)
+        self.sp_hold_thresh.setEnabled(thresh)
+        self.sp_hold_hyst.setEnabled(thresh)
+        self.sp_hold_debounce.setEnabled(dio or thresh)
+        self.sp_hold_park_v.setEnabled(self.chk_hold_park.isChecked())
+
+    def _update_hold_status(self, holding: int, gate: int):
+        """Update the status lamp; cheap when nothing changed."""
+        if self._hold_status == (holding, gate):
+            return
+        self._hold_status = (holding, gate)
+        if holding:
+            self.lbl_hold_status.setText("HOLDING")
+            style = "background-color: #FFB300; color: black;"
+        elif gate:
+            self.lbl_hold_status.setText("gate asserted (PID off)")
+            style = "background-color: #FFE082; color: black;"
+        else:
+            self.lbl_hold_status.setText("gate idle")
+            style = "background-color: #e0e0e0; color: #333;"
+        self.lbl_hold_status.setStyleSheet(
+            "QLabel { " + style + " padding: 4px; font-weight: bold; }")
+
+    def _refresh_hold_regions(self, x: np.ndarray):
+        """Shade the intervals of the input plot during which the output was held."""
+        hold = np.array(self.hold_data, dtype=int)
+        if hold.size != x.size or hold.size == 0:
+            intervals = []
+        else:
+            padded = np.concatenate(([0], hold, [0]))
+            edges = np.diff(padded)
+            starts = np.flatnonzero(edges == 1)
+            ends = np.flatnonzero(edges == -1) - 1
+            intervals = [(x[s], x[e]) for s, e in zip(starts, ends)]
+
+        # Reuse region items; create more only when needed.
+        while len(self._hold_regions) < len(intervals):
+            region = pg.LinearRegionItem(
+                values=(0, 0), movable=False,
+                brush=pg.mkBrush(255, 179, 0, 60), pen=pg.mkPen(None))
+            region.setZValue(-10)
+            self.plot_input.addItem(region)
+            self._hold_regions.append(region)
+        for region, (a, b) in zip(self._hold_regions, intervals):
+            region.setRegion((a, b))
+            region.show()
+        for region in self._hold_regions[len(intervals):]:
+            region.hide()
 
     def _on_autotune_clicked(self):
         if self._autotuning:
@@ -661,6 +900,7 @@ class ChannelPanel(QWidget):
         self.actual_out_data = deque(self.actual_out_data, maxlen=n)
         self.sp_data         = deque(self.sp_data, maxlen=n)
         self.t_data          = deque(self.t_data, maxlen=n)
+        self.hold_data       = deque(self.hold_data, maxlen=n)
 
     def reset_timebase(self):
         """Clear history and restart the time axis (e.g. on new TCP connection)."""
@@ -669,6 +909,7 @@ class ChannelPanel(QWidget):
         self.actual_out_data.clear()
         self.sp_data.clear()
         self.t_data.clear()
+        self.hold_data.clear()
         self._t0 = None
 
     def set_statistics_visible(self, visible: bool):
@@ -682,8 +923,9 @@ class ChannelPanel(QWidget):
         self.plot_psd.setVisible(visible)
         self.lbl_psd_metrics.setVisible(visible)
 
-    @Slot(float, float, float, float, float, int)
-    def add_sample(self, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+    @Slot(float, float, float, float, float, int, int, int)
+    def add_sample(self, time_s, input_v, target_out_v, actual_out_v, setpoint_v,
+                   enabled, holding=0, gate=0):
         if self._t0 is None:
             self._t0 = time_s
         self.t_data.append(time_s - self._t0)
@@ -691,6 +933,8 @@ class ChannelPanel(QWidget):
         self.target_out_data.append(target_out_v)
         self.actual_out_data.append(actual_out_v)
         self.sp_data.append(setpoint_v)
+        self.hold_data.append(1 if holding else 0)
+        self._update_hold_status(holding, gate)
 
     def set_psd_data(self, n_bins: int, fs: float, bins):
         if not self._psd_visible:
@@ -771,6 +1015,7 @@ class ChannelPanel(QWidget):
         self.curve_sp.setData(x, np.array(self.sp_data))
         self.curve_target_out.setData(x, np.array(self.target_out_data))
         self.curve_actual_out.setData(x, np.array(self.actual_out_data))
+        self._refresh_hold_regions(x)
         if self._stats_visible:
             self._refresh_stats_plot()
 
@@ -939,8 +1184,9 @@ class MainWindow(QMainWindow):
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].sync_from_params(kv)
 
-    @Slot(int, float, float, float, float, float, int)
-    def _on_data(self, ch, time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled):
+    @Slot(int, float, float, float, float, float, int, int, int)
+    def _on_data(self, ch, time_s, input_v, target_out_v, actual_out_v, setpoint_v,
+                 enabled, holding=0, gate=0):
         self._last_input[ch] = input_v
         if self._record_writer is not None and self._record_t0 is not None:
             t = time.perf_counter() - self._record_t0
@@ -958,7 +1204,8 @@ class MainWindow(QMainWindow):
             self._record_file.flush()
         if 0 <= ch < len(self.channel_panels):
             self.channel_panels[ch].add_sample(
-                time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled
+                time_s, input_v, target_out_v, actual_out_v, setpoint_v, enabled,
+                holding, gate
             )
 
     @Slot(int, int, float, object)

@@ -33,11 +33,26 @@ typedef struct {
     volatile float   autotune_relay_amp;    /* configurable relay amplitude    */
     volatile float   autotune_hysteresis;   /* configurable noise band         */
 
+    /* --- Sample and hold (parameters: TCP thread -> PID thread) ---------- */
+    volatile int     hold_mode;        /* HOLD_MODE_OFF / DIO / THRESHOLD      */
+    volatile int     hold_manual;      /* 1 = hold forced by SET <ch> hold 1   */
+    volatile int     hold_pin;         /* DIO<n>_P index (0..7), DIO mode      */
+    volatile int     hold_polarity;    /* 0 = hold while pin LOW, 1 = HIGH     */
+    volatile float   hold_thresh_v;    /* threshold mode: hold while raw < th  */
+    volatile float   hold_hyst_v;      /* release when raw > th + hyst         */
+    volatile int     hold_debounce;    /* consecutive gated samples to enter   */
+    volatile int     resume_delay_us;  /* keep holding after the gate releases */
+    volatile int     hold_park;        /* 1 = drive hold_park_v while holding  */
+    volatile float   hold_park_v;
+
     /* --- Telemetry (written by PID thread, read by TCP thread) ---  */
     volatile double  telem_time_s;         /* CLOCK_MONOTONIC secs since start */
     volatile float   telem_input_v;
     volatile float   telem_output_v;       /* target (pre-clamp)              */
     volatile float   telem_actual_output_v; /* actual (post-clamp, on the DAC) */
+    volatile int     telem_holding;        /* 1 while the PID output is held   */
+    volatile int     telem_gate;           /* raw gate state (1 = asserted)    */
+    volatile int     telem_hold_count;     /* hold events since start          */
 
     /* --- PSD (written by PSD thread, read/cleared by TCP thread) -------- */
     volatile int     psd_ready;            /* 1 = new PSD frame available     */
