@@ -42,8 +42,27 @@ typedef struct {
     volatile float   hold_hyst_v;      /* release when raw > th + hyst         */
     volatile int     hold_debounce;    /* consecutive gated samples to enter   */
     volatile int     resume_delay_us;  /* keep holding after the gate releases */
+    volatile int     hold_lookback_ms; /* hold the output from this long before the gate */
+    volatile int     hold_avg_ms;      /* ... averaged over a window of this length      */
     volatile int     hold_park;        /* 1 = drive hold_park_v while holding  */
     volatile float   hold_park_v;
+
+    /* --- External setpoint (see config.h) ------------------------------- */
+    volatile int     sp_source;        /* SP_SOURCE_INTERNAL / EXTERNAL        */
+    volatile float   sp_user_v;        /* setpoint entered by the user (internal mode) */
+    volatile float   sp_ext_pct;       /* max setpoint as % of the full-power input */
+    volatile float   sp_ext_min_v;     /* setpoint at ctrl <= 0 (V)            */
+    volatile float   sp_ext_max_v;     /* setpoint at ctrl >= sp_ext_ref (V)   */
+    volatile float   sp_ext_ref_v;     /* control voltage full scale (V)      */
+    volatile float   sp_ext_alpha;     /* LPF coefficient on the control voltage */
+    volatile int     spcal_state;      /* SPCAL_IDLE .. SPCAL_ABORT            */
+    volatile int     spcal_ramp_ms;
+    volatile int     spcal_avg_ms;
+    volatile float   spcal_zero_v;     /* input measured at out_min (last calibration) */
+    volatile float   spcal_full_v;     /* input measured at out_max            */
+    volatile float   spcal_out_min_v;  /* outputs used for those measurements  */
+    volatile float   spcal_out_v;
+    volatile float   telem_sp_ext_v;   /* filtered control voltage (external mode) */
 
     /* --- Telemetry (written by PID thread, read by TCP thread) ---  */
     volatile double  telem_time_s;         /* CLOCK_MONOTONIC secs since start */
@@ -52,7 +71,24 @@ typedef struct {
     volatile float   telem_actual_output_v; /* actual (post-clamp, on the DAC) */
     volatile int     telem_holding;        /* 1 while the PID output is held   */
     volatile int     telem_gate;           /* raw gate state (1 = asserted)    */
+    volatile int     telem_level;          /* gate source level: 1 HIGH, 0 LOW, -1 none */
+    volatile float   telem_input_raw;      /* unfiltered ADC sample of this iteration */
     volatile int     telem_hold_count;     /* hold events since start          */
+    volatile float   telem_period_us;      /* measured loop period (EMA, us)   */
+
+    /* --- Step-response capture (armed by TCP, filled by the PID thread) -- */
+    volatile int     step_state;           /* STEP_IDLE .. STEP_ABORTED        */
+    volatile float   step_delta_v;         /* setpoint step to apply           */
+    volatile int     step_ms;              /* capture length after the step    */
+    volatile int     step_pre_ms;          /* pre-trigger length               */
+    volatile int     step_fd;              /* client that requested it         */
+    volatile int     step_count;           /* samples captured so far          */
+    volatile int     step_pre_n;           /* sample index at which the step applied */
+    volatile int     step_period_us;       /* loop period during the capture   */
+    volatile float   step_sp_before;       /* setpoint before the step         */
+    float            step_t_us[STEP_MAX];  /* time since the step (us)         */
+    float            step_in[STEP_MAX];    /* raw input                        */
+    float            step_out[STEP_MAX];   /* DAC drive                        */
 
     /* --- PSD (written by PSD thread, read/cleared by TCP thread) -------- */
     volatile int     psd_ready;            /* 1 = new PSD frame available     */

@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Red Pitaya fast analog I/O abstraction.
  *
@@ -58,5 +62,9 @@ int  digital_in_init(void);
 
 /* Read DIO<pin_idx>_P. Returns 1 (high), 0 (low) or -1 on error/bad index.  */
 int  digital_in_read(int pin_idx);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ANALOG_IO_H */

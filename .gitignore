@@ -13,3 +13,6 @@ venv/
 .idea/
 *.swp
 *.swo
+
+# Measurement captures written by the GUI / scripts
+scripts/*.csv

@@ -2,16 +2,28 @@
 #include "config.h"
 #include <rp.h>
 #include <stdio.h>
+#include <unistd.h>
 
 static const rp_channel_t rp_ch[] = { RP_CH_1, RP_CH_2 };
 
 /* ------------------------------------------------------------------ init */
 
 int analog_io_init(void) {
-    if (rp_Init() != RP_OK) {
-        fprintf(stderr, "rp_Init failed\n");
-        return -1;
+    /* rp_Init reads the board model and calibration from the EEPROM over
+     * I2C. That can fail transiently right after another librp process has
+     * released the hardware, so try a few times before giving up. */
+    int rc = -1;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        rc = rp_Init();
+        if (rc == RP_OK)
+            break;
+        fprintf(stderr, "rp_Init failed (attempt %d/5, rc=%d)%s\n", attempt, rc,
+                attempt < 5 ? ", retrying in 1 s" : "");
+        rp_Release();
+        sleep(1);
     }
+    if (rc != RP_OK)
+        return -1;
 
     /* --- Fast acquisition: continuous, no trigger, no decimation --- */
     rp_AcqReset();
